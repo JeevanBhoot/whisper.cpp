@@ -110,3 +110,20 @@ target_compile_definitions(${VAD_TEST} PRIVATE
     SAMPLE_PATH="${PROJECT_SOURCE_DIR}/samples/jfk.wav")
 add_test(NAME ${VAD_TEST} COMMAND ${VAD_TEST})
 set_tests_properties(${VAD_TEST} PROPERTIES LABELS "base;en")
+
+set(COHERE_HELPER_TEST test-cohere)
+add_executable(${COHERE_HELPER_TEST} ${COHERE_HELPER_TEST}.cpp)
+target_include_directories(${COHERE_HELPER_TEST} PRIVATE ../src)
+target_link_libraries(${COHERE_HELPER_TEST} PRIVATE whisper)
+add_test(NAME ${COHERE_HELPER_TEST} COMMAND ${COHERE_HELPER_TEST})
+set_tests_properties(${COHERE_HELPER_TEST} PROPERTIES LABELS "unit")
+
+set(COHERE_PARITY_TOOL cohere-parity)
+add_executable(${COHERE_PARITY_TOOL} cohere-transcribe/cohere-parity.cpp)
+target_include_directories(${COHERE_PARITY_TOOL} PRIVATE ../src ../examples)
+target_link_libraries(${COHERE_PARITY_TOOL} PRIVATE common whisper)
+
+set(COHERE_BENCH_TOOL cohere-bench)
+add_executable(${COHERE_BENCH_TOOL} cohere-transcribe/cohere-bench.cpp)
+target_include_directories(${COHERE_BENCH_TOOL} PRIVATE ../src ../examples)
+target_link_libraries(${COHERE_BENCH_TOOL} PRIVATE common whisper)
