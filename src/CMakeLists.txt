@@ -105,6 +105,8 @@ endif()
 
 add_library(whisper
             ../include/whisper.h
+            cohere.h
+            cohere.cpp
             whisper-arch.h
             whisper.cpp
             )
