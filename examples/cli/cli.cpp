@@ -1,6 +1,7 @@
 #include "common.h"
 #include "common-whisper.h"
 
+#include "cohere.h"
 #include "whisper.h"
 #include "grammar-parser.h"
 
@@ -9,6 +10,7 @@
 #include <fstream>
 #include <cstdio>
 #include <string>
+#include <set>
 #include <thread>
 #include <vector>
 #include <cstring>
@@ -100,6 +102,7 @@ struct whisper_params {
 
     std::vector<std::string> fname_inp = {};
     std::vector<std::string> fname_out = {};
+    std::set<std::string> explicit_flags;
 
     grammar_parser::parse_state grammar_parsed;
 
@@ -146,6 +149,8 @@ static bool whisper_params_parse(int argc, char ** argv, whisper_params & params
             params.fname_inp.push_back(arg);
             continue;
         }
+
+        params.explicit_flags.insert(arg);
 
         if (arg == "-h" || arg == "--help") {
             whisper_print_usage(argc, argv, params);
@@ -303,6 +308,138 @@ static void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params
     fprintf(stderr, "  -vp N,     --vad-speech-pad-ms           N [%-7d] VAD speech padding (extend segments)\n",             params.vad_speech_pad_ms);
     fprintf(stderr, "  -vo N,     --vad-samples-overlap         N [%-7.2f] VAD samples overlap (seconds between segments)\n", params.vad_samples_overlap);
     fprintf(stderr, "\n");
+    fprintf(stderr, "Cohere GGUF note:\n");
+    fprintf(stderr, "  first-pass Cohere Transcribe support accepts only -m/--model, -f/--file,\n");
+    fprintf(stderr, "  -l/--language, -t/--threads, and optional -otxt/-of text output flags.\n");
+    fprintf(stderr, "\n");
+}
+
+static bool cohere_validate_cli_params(const whisper_params & params, std::string & error) {
+    static const std::set<std::string> allowed_flags = {
+        "-m", "--model",
+        "-f", "--file",
+        "-l", "--language",
+        "-t", "--threads",
+        "-otxt", "--output-txt",
+        "-of", "--output-file",
+    };
+
+    for (std::set<std::string>::const_iterator it = params.explicit_flags.begin(); it != params.explicit_flags.end(); ++it) {
+        if (allowed_flags.find(*it) == allowed_flags.end()) {
+            error = "unsupported option in Cohere mode: " + *it;
+            return false;
+        }
+    }
+
+    if (!params.fname_out.empty() && !params.output_txt) {
+        error = "Cohere mode requires --output-txt when --output-file is used";
+        return false;
+    }
+
+    if (params.language == "auto") {
+        error = "Cohere mode does not support automatic language detection; pass an explicit language code";
+        return false;
+    }
+
+    return true;
+}
+
+static std::string cohere_join_languages(const std::vector<std::string> & languages) {
+    std::string out;
+    for (size_t i = 0; i < languages.size(); ++i) {
+        if (!out.empty()) {
+            out += ", ";
+        }
+        out += languages[i];
+    }
+    return out;
+}
+
+static bool cohere_write_txt(
+        const whisper_params & params,
+        int file_index,
+        const std::string & fname_inp,
+        const std::string & text,
+        std::string & error) {
+    if (!params.output_txt) {
+        return true;
+    }
+
+    const std::string fname_out = file_index < (int) params.fname_out.size() ? params.fname_out[file_index] : fname_inp;
+    if (fname_out == "-") {
+        return true;
+    }
+
+    const std::string path_txt = fname_out + ".txt";
+    std::ofstream fout(path_txt.c_str());
+    if (!fout.is_open()) {
+        error = "failed to open output file '" + path_txt + "'";
+        return false;
+    }
+
+    fout << text << "\n";
+    fprintf(stderr, "%s: saving output to '%s'\n", __func__, path_txt.c_str());
+    return true;
+}
+
+static int cohere_main(const whisper_params & params) {
+    std::string error;
+    if (!cohere_validate_cli_params(params, error)) {
+        fprintf(stderr, "error: %s\n", error.c_str());
+        return 2;
+    }
+
+    cohere::model model;
+    if (!cohere::load_model(params.model, model, error)) {
+        fprintf(stderr, "error: failed to load Cohere model '%s': %s\n", params.model.c_str(), error.c_str());
+        return 3;
+    }
+
+    if (!model.vocab.is_language_supported(params.language)) {
+        fprintf(
+                stderr,
+                "error: unsupported Cohere language '%s' (supported: %s)\n",
+                params.language.c_str(),
+                cohere_join_languages(model.vocab.supported_languages).c_str());
+        cohere::free_model(model);
+        return 2;
+    }
+
+    for (int f = 0; f < (int) params.fname_inp.size(); ++f) {
+        const std::string & fname_inp = params.fname_inp[f];
+
+        std::vector<float> pcmf32;
+        std::vector<std::vector<float>> pcmf32s;
+        if (!::read_audio_data(fname_inp, pcmf32, pcmf32s, false)) {
+            fprintf(stderr, "error: failed to read audio file '%s'\n", fname_inp.c_str());
+            continue;
+        }
+
+        cohere::transcribe_params cparams;
+        cparams.language = params.language.empty() ? "en" : params.language;
+        cparams.n_threads = params.n_threads;
+        cparams.max_new_tokens = 256;
+        cparams.punctuation = true;
+
+        std::string text;
+        if (!cohere::transcribe(model, pcmf32, cparams, text, error)) {
+            fprintf(stderr, "error: failed to process '%s': %s\n", fname_inp.c_str(), error.c_str());
+            cohere::free_model(model);
+            return 10;
+        }
+
+        printf("%s\n", text.c_str());
+        fflush(stdout);
+
+        if (!cohere_write_txt(params, f, fname_inp, text, error)) {
+            fprintf(stderr, "error: %s\n", error.c_str());
+            cohere::free_model(model);
+            return 11;
+        }
+    }
+
+    cohere::free_model(model);
+    return 0;
 }
 
 struct whisper_print_user_data {
@@ -988,6 +1125,15 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "error: no input files specified\n");
         whisper_print_usage(argc, argv, params);
         return 2;
+    }
+
+    std::string model_architecture;
+    std::string probe_error;
+    const bool probe_ok = cohere::probe_model_architecture(params.model, model_architecture, &probe_error);
+    const bool is_cohere_model = probe_ok && model_architecture == "cohere-transcribe";
+
+    if (is_cohere_model) {
+        return cohere_main(params);
     }
 
     if (params.language != "auto" && whisper_lang_id(params.language.c_str()) == -1) {
