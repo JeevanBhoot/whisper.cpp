@@ -39,7 +39,7 @@ Supported platforms:
 - [x] [Raspberry Pi](https://github.com/ggml-org/whisper.cpp/discussions/166)
 - [x] [Docker](https://github.com/ggml-org/whisper.cpp/pkgs/container/whisper.cpp)
 
-The entire high-level implementation of the model is contained in [whisper.h](include/whisper.h) and [whisper.cpp](src/whisper.cpp).
+The high-level Whisper implementation is contained in [whisper.h](include/whisper.h) and [whisper.cpp](src/whisper.cpp).
 The rest of the code is part of the [`ggml`](https://github.com/ggml-org/ggml) machine learning library.
 
 Having such a lightweight implementation of the model allows to easily integrate it in different platforms and applications.
@@ -100,6 +100,14 @@ For example, you can use `ffmpeg` like this:
 ```bash
 ffmpeg -i input.mp3 -ar 16000 -ac 1 -c:a pcm_s16le output.wav
 ```
+
+## Cohere Transcribe
+
+`whisper-cli` can also run Cohere Transcribe models converted to GGUF.
+
+To convert a local Hugging Face snapshot, see the Cohere section in [models/README.md](models/README.md).
+
+Current Cohere support in `whisper-cli` is text-only transcription with an explicit `-l/--language` code.
 
 ## More audio samples
 
