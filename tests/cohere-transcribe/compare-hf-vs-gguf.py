@@ -384,7 +384,7 @@ def run_hf_native(clips: list[Clip], args: argparse.Namespace, normalizer: Any) 
     return summary, clip_results
 
 
-def run_gguf_warm(clips: list[Clip], args: argparse.Namespace, normalizer: Any) -> tuple[ModelSummary, list[ClipResult]]:
+def run_gguf_warm(clips: list[Clip], args: argparse.Namespace, normalizer: Any) -> tuple[ModelSummary, list[ClipResult], dict[str, Any]]:
     gguf_threads = args.gguf_threads or args.threads
     cmd = [
         str(args.cohere_bench),
@@ -454,7 +454,7 @@ def run_gguf_warm(clips: list[Clip], args: argparse.Namespace, normalizer: Any) 
         read_total_s=float(payload.get("read_total_s", 0.0)),
         transcribe_total_s=float(payload.get("transcribe_total_s", 0.0)),
     )
-    return summary, clip_results
+    return summary, clip_results, payload
 
 
 def print_summary(summary: ModelSummary) -> None:
@@ -493,6 +493,35 @@ def print_mismatches(name: str, clip_results: list[ClipResult], limit: int) -> N
         print(f"    hyp: {result.hypothesis}")
 
 
+def print_gguf_stage_breakdown(payload: dict[str, Any]) -> None:
+    aggregate_profile = payload.get("aggregate_profile")
+    if not isinstance(aggregate_profile, dict):
+        return
+
+    timings = aggregate_profile.get("timings_s")
+    shares = aggregate_profile.get("timing_share_of_transcribe")
+    if not isinstance(timings, dict) or not isinstance(shares, dict):
+        return
+
+    ranked: list[tuple[str, float, float]] = []
+    for name, value in timings.items():
+        try:
+            seconds = float(value)
+            share = float(shares.get(name, 0.0))
+        except Exception:
+            continue
+        ranked.append((str(name), seconds, share))
+
+    ranked.sort(key=lambda item: item[1], reverse=True)
+    if not ranked:
+        return
+
+    print()
+    print("gguf aggregate stage breakdown:")
+    for name, seconds, share in ranked[:8]:
+        print(f"  {name}: {seconds:.3f}s ({share * 100:.1f}% of transcribe)")
+
+
 def maybe_write_json(
     path: Path | None,
     args: argparse.Namespace,
@@ -501,6 +530,7 @@ def maybe_write_json(
     hf_results: list[ClipResult],
     gguf_summary: ModelSummary,
     gguf_results: list[ClipResult],
+    gguf_payload: dict[str, Any],
 ) -> None:
     if path is None:
         return
@@ -512,6 +542,14 @@ def maybe_write_json(
         "cohere_bench": str(args.cohere_bench),
         "librispeech_root": str(args.librispeech_root),
         "language": args.language,
+        "benchmark_contract": {
+            "device": "cpu",
+            "batch_size": 1,
+            "model_load_scope": "loaded_once_per_run",
+            "primary_metric": "transcribe_total_s",
+            "secondary_metric": "warm_e2e_total_s",
+            "hf_batching_in_primary_comparison": False,
+        },
         "measurement_scope": {
             "load_s": "model load once per dataset run",
             "read_total_s": "audio file decoding/reading only",
@@ -528,6 +566,8 @@ def maybe_write_json(
         "gguf_f16": {
             "summary": asdict(gguf_summary),
             "clips": [asdict(result) for result in gguf_results],
+            "aggregate_profile": gguf_payload.get("aggregate_profile"),
+            "benchmark_contract": gguf_payload.get("benchmark_contract"),
         },
     }
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -559,12 +599,13 @@ def main() -> int:
     print(f"gguf_threads={args.gguf_threads or args.threads}")
 
     hf_summary, hf_results = run_hf_native(clips, args, normalizer)
-    gguf_summary, gguf_results = run_gguf_warm(clips, args, normalizer)
+    gguf_summary, gguf_results, gguf_payload = run_gguf_warm(clips, args, normalizer)
 
     print()
     print_summary(hf_summary)
     print()
     print_summary(gguf_summary)
+    print_gguf_stage_breakdown(gguf_payload)
 
     if gguf_summary.transcribe_total_s > 0.0 and gguf_summary.warm_e2e_total_s > 0.0:
         print()
@@ -585,7 +626,7 @@ def main() -> int:
     print()
     print_mismatches("gguf-f16-warm", gguf_results, args.show_errors)
 
-    maybe_write_json(args.json_out, args, clips, hf_summary, hf_results, gguf_summary, gguf_results)
+    maybe_write_json(args.json_out, args, clips, hf_summary, hf_results, gguf_summary, gguf_results, gguf_payload)
     return 0
 
 
