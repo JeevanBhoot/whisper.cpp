@@ -68,6 +68,24 @@ The model files prefixed with `for-tests-` are empty (i.e. do not contain any we
 testing purposes. They are directly included in this repository for convenience and the Github Actions CI uses them to
 run various sanitizer tests.
 
+## Cohere Transcribe GGUF models
+
+Support for Cohere Transcribe is provided through a separate GGUF conversion script:
+
+```bash
+python3 ./models/convert-cohere-transcribe-to-gguf.py /path/to/cohere-transcribe-snapshot ./models/cohere-transcribe.gguf
+```
+
+The snapshot must be available locally. This repo does not provide download scripts or hosted Cohere model weights.
+
+Once converted, `whisper-cli` will detect the Cohere architecture automatically:
+
+```bash
+./build/bin/whisper-cli -m ./models/cohere-transcribe.gguf -l en -f samples/jfk.wav
+```
+
+Current Cohere CLI support is limited to text-only transcription with an explicit language code.
+
 ## Fine-tuned models
 
 There are community efforts for creating fine-tuned Whisper models using extra training data. For example, this
