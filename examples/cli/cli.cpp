@@ -2,6 +2,7 @@
 #include "common-whisper.h"
 
 #include "cohere.h"
+#include "gguf.h"
 #include "whisper.h"
 #include "grammar-parser.h"
 
@@ -31,6 +32,28 @@ static void replace_all(std::string & s, const std::string & search, const std::
         s.erase(pos, search.length());
         s.insert(pos, replace);
     }
+}
+
+static bool whisper_cli_read_model_architecture(const std::string & path_model, std::string & architecture) {
+    architecture.clear();
+
+    struct gguf_init_params params = {
+        /*.no_alloc =*/ true,
+        /*.ctx      =*/ nullptr,
+    };
+
+    struct gguf_context * gguf = gguf_init_from_file(path_model.c_str(), params);
+    if (gguf == nullptr) {
+        return false;
+    }
+
+    const int64_t kid = gguf_find_key(gguf, "general.architecture");
+    if (kid >= 0 && gguf_get_kv_type(gguf, kid) == GGUF_TYPE_STRING) {
+        architecture = gguf_get_val_str(gguf, kid);
+    }
+
+    gguf_free(gguf);
+    return true;
 }
 
 // command-line parameters
@@ -308,9 +331,10 @@ static void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params
     fprintf(stderr, "  -vp N,     --vad-speech-pad-ms           N [%-7d] VAD speech padding (extend segments)\n",             params.vad_speech_pad_ms);
     fprintf(stderr, "  -vo N,     --vad-samples-overlap         N [%-7.2f] VAD samples overlap (seconds between segments)\n", params.vad_samples_overlap);
     fprintf(stderr, "\n");
-    fprintf(stderr, "Cohere GGUF note:\n");
-    fprintf(stderr, "  first-pass Cohere Transcribe support accepts only -m/--model, -f/--file,\n");
-    fprintf(stderr, "  -l/--language, -t/--threads, and optional -otxt/-of text output flags.\n");
+    fprintf(stderr, "Cohere note:\n");
+    fprintf(stderr, "  Cohere Transcribe GGUF models are detected automatically from model metadata.\n");
+    fprintf(stderr, "  Cohere mode currently supports text-only transcription with -m/-f/-l/-t,\n");
+    fprintf(stderr, "  optional -np, and optional -otxt/-of text file output.\n");
     fprintf(stderr, "\n");
 }
 
@@ -320,6 +344,7 @@ static bool cohere_validate_cli_params(const whisper_params & params, std::strin
         "-f", "--file",
         "-l", "--language",
         "-t", "--threads",
+        "-np", "--no-prints",
         "-otxt", "--output-txt",
         "-of", "--output-file",
     };
@@ -378,7 +403,9 @@ static bool cohere_write_txt(
     }
 
     fout << text << "\n";
-    fprintf(stderr, "%s: saving output to '%s'\n", __func__, path_txt.c_str());
+    if (!params.no_prints) {
+        fprintf(stderr, "%s: saving output to '%s'\n", __func__, path_txt.c_str());
+    }
     return true;
 }
 
@@ -1128,12 +1155,15 @@ int main(int argc, char ** argv) {
     }
 
     std::string model_architecture;
-    std::string probe_error;
-    const bool probe_ok = cohere::probe_model_architecture(params.model, model_architecture, &probe_error);
-    const bool is_cohere_model = probe_ok && model_architecture == "cohere-transcribe";
+    if (whisper_cli_read_model_architecture(params.model, model_architecture)) {
+        if (model_architecture == "cohere-transcribe") {
+            return cohere_main(params);
+        }
 
-    if (is_cohere_model) {
-        return cohere_main(params);
+        if (!model_architecture.empty()) {
+            fprintf(stderr, "error: unsupported model architecture '%s'\n", model_architecture.c_str());
+            return 3;
+        }
     }
 
     if (params.language != "auto" && whisper_lang_id(params.language.c_str()) == -1) {
