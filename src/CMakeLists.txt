@@ -101,12 +101,35 @@ if (WHISPER_OPENVINO)
     set_target_properties(${TARGET} PROPERTIES FOLDER "libs")
 endif()
 
+set(COHERE_TARGET whisper-cohere)
+add_library(${COHERE_TARGET} STATIC
+            cohere.h
+            cohere.cpp
+            )
+
+target_include_directories(${COHERE_TARGET} PRIVATE .)
+target_compile_features   (${COHERE_TARGET} PUBLIC cxx_std_11) # don't bump
+
+find_package(Threads REQUIRED)
+target_link_libraries(${COHERE_TARGET} PUBLIC ggml Threads::Threads)
+
+if (GGML_BLAS)
+    find_package(BLAS)
+    if (BLAS_FOUND)
+        target_link_libraries(${COHERE_TARGET} PRIVATE ${BLAS_LIBRARIES})
+        target_compile_options(${COHERE_TARGET} PRIVATE ${BLAS_LINKER_FLAGS})
+        if (NOT "${BLAS_INCLUDE_DIRS}" STREQUAL "")
+            target_include_directories(${COHERE_TARGET} SYSTEM PRIVATE ${BLAS_INCLUDE_DIRS})
+        endif()
+    endif()
+endif()
+
+set_target_properties(${COHERE_TARGET} PROPERTIES FOLDER "libs")
+
 # whisper
 
 add_library(whisper
             ../include/whisper.h
-            cohere.h
-            cohere.cpp
             whisper-arch.h
             whisper.cpp
             )
@@ -117,7 +140,7 @@ set_target_properties(whisper PROPERTIES
     SOVERSION ${SOVERSION}
 )
 
-target_include_directories(whisper PUBLIC . ../include)
+target_include_directories(whisper PUBLIC ../include PRIVATE .)
 target_compile_features   (whisper PUBLIC cxx_std_11) # don't bump
 
 if (CMAKE_CXX_BYTE_ORDER STREQUAL "BIG_ENDIAN")
@@ -128,7 +151,6 @@ if (WHISPER_EXTRA_FLAGS)
     target_compile_options(whisper PRIVATE ${WHISPER_EXTRA_FLAGS})
 endif()
 
-find_package(Threads REQUIRED)
 target_link_libraries(whisper PUBLIC ggml Threads::Threads)
 
 if (GGML_BLAS)

@@ -1,6 +1,7 @@
 #include "cohere.h"
 
 #include "ggml-cpu.h"
+#include "gguf.h"
 
 #include <algorithm>
 #include <cmath>
@@ -16,6 +17,7 @@
 
 #if defined(__has_include)
 #if __has_include(<Accelerate/Accelerate.h>)
+#define ACCELERATE_NEW_LAPACK
 #include <Accelerate/Accelerate.h>
 #define COHERE_HAVE_CBLAS 1
 #elif __has_include(<cblas.h>)
@@ -55,26 +57,6 @@ struct ggml_context_deleter {
 
 typedef std::unique_ptr<struct gguf_context, gguf_context_deleter> gguf_ptr;
 typedef std::unique_ptr<struct ggml_context, ggml_context_deleter> ggml_ptr;
-
-struct scope_timer {
-    int64_t * target = nullptr;
-    int64_t start_us = 0;
-
-    explicit scope_timer(int64_t * target_) : target(target_), start_us(target_ ? ggml_time_us() : 0) {
-    }
-
-    ~scope_timer() {
-        if (target != nullptr) {
-            *target += ggml_time_us() - start_us;
-        }
-    }
-};
-
-static inline void add_counter(int64_t * value, int64_t delta = 1) {
-    if (value != nullptr) {
-        *value += delta;
-    }
-}
 
 struct tensor2d {
     int32_t n0 = 0;
@@ -141,7 +123,6 @@ struct linear_workspace {
 };
 
 struct inference_runtime {
-    transcribe_profile * profile = nullptr;
     linear_workspace linear_ws;
     std::map<int64_t, tensor2d> rel_pos_cache;
     std::vector<uint8_t> vec_dot_input_buffer;
@@ -245,9 +226,7 @@ static const fft_trig_cache & get_fft_trig_cache(int32_t n) {
 static linear_workspace make_linear_workspace(inference_runtime * runtime) {
     linear_workspace ws;
     ws.ctx = make_compute_ctx();
-    if (runtime != nullptr && runtime->profile != nullptr) {
-        add_counter(&runtime->profile->counters.ggml_context_creations);
-    }
+    GGML_UNUSED(runtime);
     return ws;
 }
 
@@ -259,32 +238,15 @@ static struct ggml_context * begin_linear_workspace(inference_runtime * runtime)
         runtime->linear_ws = make_linear_workspace(runtime);
     } else {
         ggml_reset(runtime->linear_ws.ctx.get());
-        if (runtime->profile != nullptr) {
-            add_counter(&runtime->profile->counters.ggml_context_resets);
-        }
     }
     return runtime->linear_ws.ctx.get();
-}
-
-static int64_t * counter_ptr(inference_runtime * runtime, int64_t overhead_counters::* member) {
-    if (runtime == nullptr || runtime->profile == nullptr) {
-        return nullptr;
-    }
-    return &(runtime->profile->counters.*member);
-}
-
-static int64_t * timer_ptr(inference_runtime * runtime, int64_t timing_breakdown_us::* member) {
-    if (runtime == nullptr || runtime->profile == nullptr) {
-        return nullptr;
-    }
-    return &(runtime->profile->timings_us.*member);
 }
 
 static void run_graph(struct ggml_context * ctx, struct ggml_tensor * output, int32_t n_threads, inference_runtime * runtime = nullptr) {
     struct ggml_cgraph * gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, output);
 
-    add_counter(counter_ptr(runtime, &overhead_counters::ggml_graph_launches));
+    GGML_UNUSED(runtime);
     if (ggml_graph_compute_with_ctx(ctx, gf, n_threads) != GGML_STATUS_SUCCESS) {
         throw std::runtime_error("ggml graph execution failed");
     }
@@ -300,7 +262,7 @@ static void run_graph_outputs(
         ggml_build_forward_expand(gf, output);
     }
 
-    add_counter(counter_ptr(runtime, &overhead_counters::ggml_graph_launches));
+    GGML_UNUSED(runtime);
     if (ggml_graph_compute_with_ctx(ctx, gf, n_threads) != GGML_STATUS_SUCCESS) {
         throw std::runtime_error("ggml graph execution failed");
     }
@@ -478,19 +440,6 @@ static tensor4d tensor_from_ggml_4d(const struct ggml_tensor * tensor) {
     return out;
 }
 
-static matrix_output matrix_output_from_tensor2d(const tensor2d & tensor) {
-    matrix_output out;
-    out.rows = tensor.n0;
-    out.cols = tensor.n1;
-    out.data.resize(size_t(out.rows) * size_t(out.cols));
-    for (int32_t row = 0; row < out.rows; ++row) {
-        for (int32_t col = 0; col < out.cols; ++col) {
-            out.data[size_t(row) * size_t(out.cols) + size_t(col)] = tensor.at(row, col);
-        }
-    }
-    return out;
-}
-
 static enum ggml_type matmul_input_type_from_weight(const struct ggml_tensor * weight) {
     if (weight == nullptr) {
         return GGML_TYPE_F32;
@@ -530,7 +479,7 @@ static struct ggml_tensor * create_input_tensor_2d(
         throw std::runtime_error("unsupported ggml input tensor type");
     }
 
-    add_counter(counter_ptr(runtime, &overhead_counters::input_tensor_copies));
+    GGML_UNUSED(runtime);
     return tensor;
 }
 
@@ -548,7 +497,7 @@ static struct ggml_tensor * create_input_tensor_4d(struct ggml_context * ctx, co
         throw std::runtime_error("failed to allocate ggml input tensor");
     }
     std::memcpy(tensor->data, input.data.data(), input.data.size() * sizeof(float));
-    add_counter(counter_ptr(runtime, &overhead_counters::input_tensor_copies));
+    GGML_UNUSED(runtime);
     return tensor;
 }
 
@@ -631,8 +580,6 @@ static tensor2d eval_linear(
         const tensor2d & input,
         int32_t n_threads,
         inference_runtime * runtime = nullptr) {
-    add_counter(counter_ptr(runtime, &overhead_counters::eval_linear_calls));
-
     if (can_use_vec_dot_linear(weight, input)) {
         return eval_linear_vec_dot(weight, bias, input, runtime);
     }
@@ -653,7 +600,6 @@ static tensor2d eval_linear(
     run_graph(ctx, cur, n_threads, runtime);
 
     tensor2d out = tensor_from_ggml_2d(cur);
-    add_counter(counter_ptr(runtime, &overhead_counters::output_tensor_copies));
 
     return out;
 }
@@ -664,8 +610,6 @@ static tensor2d eval_linear_from_rank3_weight(
         const tensor2d & input,
         int32_t n_threads,
         inference_runtime * runtime = nullptr) {
-    add_counter(counter_ptr(runtime, &overhead_counters::eval_linear_rank3_calls));
-
     ggml_ptr ctx_holder;
     struct ggml_context * ctx = begin_linear_workspace(runtime);
     if (ctx == nullptr) {
@@ -683,7 +627,6 @@ static tensor2d eval_linear_from_rank3_weight(
     run_graph(ctx, cur, n_threads, runtime);
 
     tensor2d out = tensor_from_ggml_2d(cur);
-    add_counter(counter_ptr(runtime, &overhead_counters::output_tensor_copies));
 
     return out;
 }
@@ -694,8 +637,6 @@ static tensor2d eval_linear_from_rank4_weight(
         const tensor2d & input,
         int32_t n_threads,
         inference_runtime * runtime = nullptr) {
-    add_counter(counter_ptr(runtime, &overhead_counters::eval_linear_rank3_calls));
-
     ggml_ptr ctx_holder;
     struct ggml_context * ctx = begin_linear_workspace(runtime);
     if (ctx == nullptr) {
@@ -713,7 +654,6 @@ static tensor2d eval_linear_from_rank4_weight(
     run_graph(ctx, cur, n_threads, runtime);
 
     tensor2d out = tensor_from_ggml_2d(cur);
-    add_counter(counter_ptr(runtime, &overhead_counters::output_tensor_copies));
 
     return out;
 }
@@ -757,8 +697,6 @@ static tensor2d eval_linear_activation_linear(
         const std::string & act,
         int32_t n_threads,
         inference_runtime * runtime = nullptr) {
-    add_counter(counter_ptr(runtime, &overhead_counters::eval_linear_calls), 2);
-
     if (input.n1 == 1 &&
             can_use_vec_dot_linear(w1, input) &&
             ggml_is_contiguous(w2) &&
@@ -795,7 +733,6 @@ static tensor2d eval_linear_activation_linear(
     run_graph(ctx, cur, n_threads, runtime);
 
     tensor2d out = tensor_from_ggml_2d(cur);
-    add_counter(counter_ptr(runtime, &overhead_counters::output_tensor_copies));
 
     return out;
 }
@@ -1177,11 +1114,9 @@ static const tensor2d & get_relative_positional_encoding(inference_runtime * run
     const int64_t key = rel_pos_cache_key(d_model, length);
     const std::map<int64_t, tensor2d>::iterator it = runtime->rel_pos_cache.find(key);
     if (it != runtime->rel_pos_cache.end()) {
-        add_counter(counter_ptr(runtime, &overhead_counters::rel_pos_cache_hits));
         return it->second;
     }
 
-    add_counter(counter_ptr(runtime, &overhead_counters::rel_pos_cache_misses));
     return runtime->rel_pos_cache.emplace(key, build_relative_positional_encoding(d_model, length)).first->second;
 }
 
@@ -1227,7 +1162,6 @@ static tensor2d encoder_self_attention(
     tensor2d k = tensor_from_ggml_2d(k_tensor);
     tensor2d v = tensor_from_ggml_2d(v_tensor);
     tensor2d p = tensor_from_ggml_2d(p_tensor);
-    add_counter(counter_ptr(runtime, &overhead_counters::output_tensor_copies), 4);
 
     tensor2d attn(hidden, length);
     const float * pos_u = tensor_data_f32(pos_bias_u);
@@ -1412,127 +1346,92 @@ static tensor2d conformer_convolution(
     return eval_linear_from_rank3_weight(pointwise2_w, pointwise2_b, cur, n_threads, runtime);
 }
 
-struct conformer_layer_trace {
-    tensor2d after_ff1;
-    tensor2d after_attn;
-    tensor2d after_conv;
-    tensor2d out;
-};
-
 static tensor2d run_conformer_layer(
         const model & model,
         int32_t layer_idx,
         const tensor2d & input,
         int32_t valid_length,
         int32_t n_threads,
-        inference_runtime * runtime = nullptr,
-        conformer_layer_trace * trace = nullptr) {
+        inference_runtime * runtime = nullptr) {
     const std::string prefix = format("encoder.layers.%d.", layer_idx);
 
     tensor2d cur = input;
 
-    {
-        scope_timer timer(timer_ptr(runtime, &timing_breakdown_us::encoder_ffn));
-        tensor2d ff_in = layer_norm(
-                cur,
-                require_tensor(model, prefix + "norm_feed_forward1.weight", GGML_TYPE_F32),
-                require_tensor(model, prefix + "norm_feed_forward1.bias", GGML_TYPE_F32));
+    tensor2d ff_in = layer_norm(
+            cur,
+            require_tensor(model, prefix + "norm_feed_forward1.weight", GGML_TYPE_F32),
+            require_tensor(model, prefix + "norm_feed_forward1.bias", GGML_TYPE_F32));
 
-        tensor2d ff_out = feed_forward(
-                ff_in,
-                require_tensor(model, prefix + "feed_forward1.linear1.weight"),
-                require_tensor(model, prefix + "feed_forward1.linear1.bias", GGML_TYPE_F32),
-                require_tensor(model, prefix + "feed_forward1.linear2.weight"),
-                require_tensor(model, prefix + "feed_forward1.linear2.bias", GGML_TYPE_F32),
-                n_threads,
-                runtime);
-        cur = add_scaled(cur, ff_out, 0.5f);
-        if (trace != nullptr) {
-            trace->after_ff1 = cur;
-        }
-    }
+    tensor2d ff_out = feed_forward(
+            ff_in,
+            require_tensor(model, prefix + "feed_forward1.linear1.weight"),
+            require_tensor(model, prefix + "feed_forward1.linear1.bias", GGML_TYPE_F32),
+            require_tensor(model, prefix + "feed_forward1.linear2.weight"),
+            require_tensor(model, prefix + "feed_forward1.linear2.bias", GGML_TYPE_F32),
+            n_threads,
+            runtime);
+    cur = add_scaled(cur, ff_out, 0.5f);
 
-    {
-        scope_timer timer(timer_ptr(runtime, &timing_breakdown_us::encoder_self_attention));
-        tensor2d att_in = layer_norm(
-                cur,
-                require_tensor(model, prefix + "norm_self_att.weight", GGML_TYPE_F32),
-                require_tensor(model, prefix + "norm_self_att.bias", GGML_TYPE_F32));
+    tensor2d att_in = layer_norm(
+            cur,
+            require_tensor(model, prefix + "norm_self_att.weight", GGML_TYPE_F32),
+            require_tensor(model, prefix + "norm_self_att.bias", GGML_TYPE_F32));
 
-        tensor2d att_out = encoder_self_attention(
-                att_in,
-                require_tensor(model, prefix + "self_attn.linear_q.weight"),
-                require_tensor(model, prefix + "self_attn.linear_q.bias", GGML_TYPE_F32),
-                require_tensor(model, prefix + "self_attn.linear_k.weight"),
-                require_tensor(model, prefix + "self_attn.linear_k.bias", GGML_TYPE_F32),
-                require_tensor(model, prefix + "self_attn.linear_v.weight"),
-                require_tensor(model, prefix + "self_attn.linear_v.bias", GGML_TYPE_F32),
-                require_tensor(model, prefix + "self_attn.linear_pos.weight"),
-                require_tensor(model, prefix + "self_attn.linear_out.weight"),
-                require_tensor(model, prefix + "self_attn.linear_out.bias", GGML_TYPE_F32),
-                require_tensor(model, prefix + "self_attn.pos_bias_u", GGML_TYPE_F32),
-                require_tensor(model, prefix + "self_attn.pos_bias_v", GGML_TYPE_F32),
-                model.encoder.n_heads,
-                n_threads,
-                runtime);
+    tensor2d att_out = encoder_self_attention(
+            att_in,
+            require_tensor(model, prefix + "self_attn.linear_q.weight"),
+            require_tensor(model, prefix + "self_attn.linear_q.bias", GGML_TYPE_F32),
+            require_tensor(model, prefix + "self_attn.linear_k.weight"),
+            require_tensor(model, prefix + "self_attn.linear_k.bias", GGML_TYPE_F32),
+            require_tensor(model, prefix + "self_attn.linear_v.weight"),
+            require_tensor(model, prefix + "self_attn.linear_v.bias", GGML_TYPE_F32),
+            require_tensor(model, prefix + "self_attn.linear_pos.weight"),
+            require_tensor(model, prefix + "self_attn.linear_out.weight"),
+            require_tensor(model, prefix + "self_attn.linear_out.bias", GGML_TYPE_F32),
+            require_tensor(model, prefix + "self_attn.pos_bias_u", GGML_TYPE_F32),
+            require_tensor(model, prefix + "self_attn.pos_bias_v", GGML_TYPE_F32),
+            model.encoder.n_heads,
+            n_threads,
+            runtime);
+    cur = add_scaled(cur, att_out, 1.0f);
 
-        cur = add_scaled(cur, att_out, 1.0f);
-        if (trace != nullptr) {
-            trace->after_attn = cur;
-        }
-    }
+    tensor2d conv_in = layer_norm(
+            cur,
+            require_tensor(model, prefix + "norm_conv.weight", GGML_TYPE_F32),
+            require_tensor(model, prefix + "norm_conv.bias", GGML_TYPE_F32));
 
-    {
-        scope_timer timer(timer_ptr(runtime, &timing_breakdown_us::encoder_conv));
-        tensor2d conv_in = layer_norm(
-                cur,
-                require_tensor(model, prefix + "norm_conv.weight", GGML_TYPE_F32),
-                require_tensor(model, prefix + "norm_conv.bias", GGML_TYPE_F32));
+    tensor2d conv_out = conformer_convolution(
+            conv_in,
+            require_tensor(model, prefix + "conv.pointwise_conv1.weight"),
+            require_tensor(model, prefix + "conv.pointwise_conv1.bias", GGML_TYPE_F32),
+            require_tensor(model, prefix + "conv.depthwise_conv.weight"),
+            require_tensor(model, prefix + "conv.depthwise_conv.bias", GGML_TYPE_F32),
+            require_tensor(model, prefix + "conv.pointwise_conv2.weight"),
+            require_tensor(model, prefix + "conv.pointwise_conv2.bias", GGML_TYPE_F32),
+            valid_length,
+            n_threads,
+            runtime);
+    cur = add_scaled(cur, conv_out, 1.0f);
 
-        tensor2d conv_out = conformer_convolution(
-                conv_in,
-                require_tensor(model, prefix + "conv.pointwise_conv1.weight"),
-                require_tensor(model, prefix + "conv.pointwise_conv1.bias", GGML_TYPE_F32),
-                require_tensor(model, prefix + "conv.depthwise_conv.weight"),
-                require_tensor(model, prefix + "conv.depthwise_conv.bias", GGML_TYPE_F32),
-                require_tensor(model, prefix + "conv.pointwise_conv2.weight"),
-                require_tensor(model, prefix + "conv.pointwise_conv2.bias", GGML_TYPE_F32),
-                valid_length,
-                n_threads,
-                runtime);
+    ff_in = layer_norm(
+            cur,
+            require_tensor(model, prefix + "norm_feed_forward2.weight", GGML_TYPE_F32),
+            require_tensor(model, prefix + "norm_feed_forward2.bias", GGML_TYPE_F32));
 
-        cur = add_scaled(cur, conv_out, 1.0f);
-        if (trace != nullptr) {
-            trace->after_conv = cur;
-        }
-    }
+    ff_out = feed_forward(
+            ff_in,
+            require_tensor(model, prefix + "feed_forward2.linear1.weight"),
+            require_tensor(model, prefix + "feed_forward2.linear1.bias", GGML_TYPE_F32),
+            require_tensor(model, prefix + "feed_forward2.linear2.weight"),
+            require_tensor(model, prefix + "feed_forward2.linear2.bias", GGML_TYPE_F32),
+            n_threads,
+            runtime);
+    cur = add_scaled(cur, ff_out, 0.5f);
 
-    {
-        scope_timer timer(timer_ptr(runtime, &timing_breakdown_us::encoder_ffn));
-        tensor2d ff_in = layer_norm(
-                cur,
-                require_tensor(model, prefix + "norm_feed_forward2.weight", GGML_TYPE_F32),
-                require_tensor(model, prefix + "norm_feed_forward2.bias", GGML_TYPE_F32));
-
-        tensor2d ff_out = feed_forward(
-                ff_in,
-                require_tensor(model, prefix + "feed_forward2.linear1.weight"),
-                require_tensor(model, prefix + "feed_forward2.linear1.bias", GGML_TYPE_F32),
-                require_tensor(model, prefix + "feed_forward2.linear2.weight"),
-                require_tensor(model, prefix + "feed_forward2.linear2.bias", GGML_TYPE_F32),
-                n_threads,
-                runtime);
-        cur = add_scaled(cur, ff_out, 0.5f);
-    }
-
-    tensor2d out = layer_norm(
+    return layer_norm(
             cur,
             require_tensor(model, prefix + "norm_out.weight", GGML_TYPE_F32),
             require_tensor(model, prefix + "norm_out.bias", GGML_TYPE_F32));
-    if (trace != nullptr) {
-        trace->out = out;
-    }
-    return out;
 }
 
 static tensor2d run_conv_subsampling(
@@ -1801,65 +1700,7 @@ static tensor2d compute_mel_features(const std::vector<float> & audio, const fro
     return mel;
 }
 
-struct encoder_trace {
-    tensor2d mel;
-    tensor2d subsampling_out;
-    tensor2d block0_after_ff1;
-    tensor2d block0_after_attn;
-    tensor2d block0_after_conv;
-    tensor2d block0_out;
-    tensor2d encoder_out;
-    tensor2d encoder_projected;
-    int32_t encoder_length = 0;
-};
-
 static tensor2d project_encoder_for_decoder(model & model, const tensor2d & encoder_out, int32_t n_threads, inference_runtime * runtime = nullptr);
-
-static encoder_trace run_encoder_trace(model & model, const std::vector<float> & pcmf32, int32_t n_threads, inference_runtime * runtime = nullptr) {
-    encoder_trace trace;
-    {
-        scope_timer timer(timer_ptr(runtime, &timing_breakdown_us::frontend));
-        trace.mel = compute_mel_features(pcmf32, model.frontend, n_threads);
-    }
-    const int32_t valid_mel_frames = std::max<int32_t>(1, int32_t(pcmf32.size() / size_t(model.frontend.hop_length)));
-    trace.encoder_length = conv_subsampling_output_length(valid_mel_frames);
-    if (runtime != nullptr && runtime->profile != nullptr) {
-        runtime->profile->encoder_frame_count = trace.encoder_length;
-    }
-
-    {
-        scope_timer timer(timer_ptr(runtime, &timing_breakdown_us::subsampling));
-        trace.subsampling_out = run_conv_subsampling(model, trace.mel, valid_mel_frames, n_threads, runtime);
-    }
-    tensor2d cur = trace.subsampling_out;
-    {
-        scope_timer timer(timer_ptr(runtime, &timing_breakdown_us::encoder_total));
-        for (int32_t il = 0; il < model.encoder.n_layers; ++il) {
-            conformer_layer_trace layer_trace;
-            cur = run_conformer_layer(
-                    model,
-                    il,
-                    cur,
-                    trace.encoder_length,
-                    n_threads,
-                    runtime,
-                    il == 0 ? &layer_trace : nullptr);
-            if (il == 0) {
-                trace.block0_after_ff1 = layer_trace.after_ff1;
-                trace.block0_after_attn = layer_trace.after_attn;
-                trace.block0_after_conv = layer_trace.after_conv;
-                trace.block0_out = layer_trace.out;
-            }
-        }
-    }
-
-    trace.encoder_out = cur;
-    {
-        scope_timer timer(timer_ptr(runtime, &timing_breakdown_us::encoder_projection));
-        trace.encoder_projected = project_encoder_for_decoder(model, trace.encoder_out, n_threads, runtime);
-    }
-    return trace;
-}
 
 static tensor2d project_encoder_for_decoder(model & model, const tensor2d & encoder_out, int32_t n_threads, inference_runtime * runtime) {
     if (!model.has_encoder_decoder_proj) {
@@ -1875,9 +1716,16 @@ static tensor2d project_encoder_for_decoder(model & model, const tensor2d & enco
 }
 
 static tensor2d run_encoder(model & model, const std::vector<float> & pcmf32, int32_t n_threads, int32_t & encoder_length, inference_runtime * runtime = nullptr) {
-    encoder_trace trace = run_encoder_trace(model, pcmf32, n_threads, runtime);
-    encoder_length = trace.encoder_length;
-    return trace.encoder_projected;
+    const int32_t valid_mel_frames = std::max<int32_t>(1, int32_t(pcmf32.size() / size_t(model.frontend.hop_length)));
+    encoder_length = conv_subsampling_output_length(valid_mel_frames);
+
+    tensor2d mel = compute_mel_features(pcmf32, model.frontend, n_threads);
+    tensor2d cur = run_conv_subsampling(model, mel, valid_mel_frames, n_threads, runtime);
+    for (int32_t il = 0; il < model.encoder.n_layers; ++il) {
+        cur = run_conformer_layer(model, il, cur, encoder_length, n_threads, runtime);
+    }
+
+    return project_encoder_for_decoder(model, cur, n_threads, runtime);
 }
 
 static tensor2d get_decoder_embedding(const model & model, int32_t token_id, int32_t position) {
@@ -2192,7 +2040,6 @@ static std::vector<cross_kv_cache> build_cross_kv(
 
         caches[size_t(il)].key = tensor_from_ggml_2d(key_tensor);
         caches[size_t(il)].value = tensor_from_ggml_2d(value_tensor);
-        add_counter(counter_ptr(runtime, &overhead_counters::output_tensor_copies), 2);
     }
     return caches;
 }
@@ -2220,82 +2067,73 @@ static std::vector<float> decoder_step(
     for (int32_t il = 0; il < model.decoder.num_layers; ++il) {
         const std::string prefix = format("decoder.layers.%d.", il);
 
-        {
-            scope_timer timer(timer_ptr(runtime, &timing_breakdown_us::decoder_self_attention));
-            tensor2d norm = layer_norm(
-                    hidden,
-                    require_tensor(model, prefix + "layer_norm_1.weight", GGML_TYPE_F32),
-                    require_tensor(model, prefix + "layer_norm_1.bias", GGML_TYPE_F32));
+        tensor2d norm = layer_norm(
+                hidden,
+                require_tensor(model, prefix + "layer_norm_1.weight", GGML_TYPE_F32),
+                require_tensor(model, prefix + "layer_norm_1.bias", GGML_TYPE_F32));
 
-            tensor2d q = eval_linear(
-                    require_tensor(model, prefix + "self_attn.query.weight"),
-                    require_tensor(model, prefix + "self_attn.query.bias", GGML_TYPE_F32),
-                    norm,
-                    n_threads,
-                    runtime);
-            tensor2d k = eval_linear(
-                    require_tensor(model, prefix + "self_attn.key.weight"),
-                    require_tensor(model, prefix + "self_attn.key.bias", GGML_TYPE_F32),
-                    norm,
-                    n_threads,
-                    runtime);
-            tensor2d v = eval_linear(
-                    require_tensor(model, prefix + "self_attn.value.weight"),
-                    require_tensor(model, prefix + "self_attn.value.bias", GGML_TYPE_F32),
-                    norm,
-                    n_threads,
-                    runtime);
+        tensor2d q = eval_linear(
+                require_tensor(model, prefix + "self_attn.query.weight"),
+                require_tensor(model, prefix + "self_attn.query.bias", GGML_TYPE_F32),
+                norm,
+                n_threads,
+                runtime);
+        tensor2d k = eval_linear(
+                require_tensor(model, prefix + "self_attn.key.weight"),
+                require_tensor(model, prefix + "self_attn.key.bias", GGML_TYPE_F32),
+                norm,
+                n_threads,
+                runtime);
+        tensor2d v = eval_linear(
+                require_tensor(model, prefix + "self_attn.value.weight"),
+                require_tensor(model, prefix + "self_attn.value.bias", GGML_TYPE_F32),
+                norm,
+                n_threads,
+                runtime);
 
-            tensor2d attn = decoder_self_attention_single(q, self_kv[size_t(il)], k, v, model.decoder.num_attention_heads);
-            tensor2d proj = eval_linear(
-                    require_tensor(model, prefix + "self_attn.out.weight"),
-                    require_tensor(model, prefix + "self_attn.out.bias", GGML_TYPE_F32),
-                    attn,
-                    n_threads,
-                    runtime);
-            hidden = add_scaled(hidden, proj, 1.0f);
-        }
+        tensor2d attn = decoder_self_attention_single(q, self_kv[size_t(il)], k, v, model.decoder.num_attention_heads);
+        tensor2d proj = eval_linear(
+                require_tensor(model, prefix + "self_attn.out.weight"),
+                require_tensor(model, prefix + "self_attn.out.bias", GGML_TYPE_F32),
+                attn,
+                n_threads,
+                runtime);
+        hidden = add_scaled(hidden, proj, 1.0f);
 
-        {
-            scope_timer timer(timer_ptr(runtime, &timing_breakdown_us::decoder_cross_attention));
-            tensor2d norm = layer_norm(
-                    hidden,
-                    require_tensor(model, prefix + "layer_norm_2.weight", GGML_TYPE_F32),
-                    require_tensor(model, prefix + "layer_norm_2.bias", GGML_TYPE_F32));
+        norm = layer_norm(
+                hidden,
+                require_tensor(model, prefix + "layer_norm_2.weight", GGML_TYPE_F32),
+                require_tensor(model, prefix + "layer_norm_2.bias", GGML_TYPE_F32));
 
-            tensor2d q = eval_linear(
-                    require_tensor(model, prefix + "cross_attn.query.weight"),
-                    require_tensor(model, prefix + "cross_attn.query.bias", GGML_TYPE_F32),
-                    norm,
-                    n_threads,
-                    runtime);
-            tensor2d attn = decoder_cross_attention_single(q, cross_kv[size_t(il)], model.decoder.num_attention_heads);
-            tensor2d proj = eval_linear(
-                    require_tensor(model, prefix + "cross_attn.out.weight"),
-                    require_tensor(model, prefix + "cross_attn.out.bias", GGML_TYPE_F32),
-                    attn,
-                    n_threads,
-                    runtime);
-            hidden = add_scaled(hidden, proj, 1.0f);
-        }
+        q = eval_linear(
+                require_tensor(model, prefix + "cross_attn.query.weight"),
+                require_tensor(model, prefix + "cross_attn.query.bias", GGML_TYPE_F32),
+                norm,
+                n_threads,
+                runtime);
+        attn = decoder_cross_attention_single(q, cross_kv[size_t(il)], model.decoder.num_attention_heads);
+        proj = eval_linear(
+                require_tensor(model, prefix + "cross_attn.out.weight"),
+                require_tensor(model, prefix + "cross_attn.out.bias", GGML_TYPE_F32),
+                attn,
+                n_threads,
+                runtime);
+        hidden = add_scaled(hidden, proj, 1.0f);
 
-        {
-            scope_timer timer(timer_ptr(runtime, &timing_breakdown_us::decoder_ffn));
-            tensor2d norm = layer_norm(
-                    hidden,
-                    require_tensor(model, prefix + "layer_norm_3.weight", GGML_TYPE_F32),
-                    require_tensor(model, prefix + "layer_norm_3.bias", GGML_TYPE_F32));
-            tensor2d ff = decoder_feed_forward(
-                    norm,
-                    require_tensor(model, prefix + "feed_forward.dense_in.weight"),
-                    require_tensor(model, prefix + "feed_forward.dense_in.bias", GGML_TYPE_F32),
-                    require_tensor(model, prefix + "feed_forward.dense_out.weight"),
-                    require_tensor(model, prefix + "feed_forward.dense_out.bias", GGML_TYPE_F32),
-                    model.decoder.hidden_act,
-                    n_threads,
-                    runtime);
-            hidden = add_scaled(hidden, ff, 1.0f);
-        }
+        norm = layer_norm(
+                hidden,
+                require_tensor(model, prefix + "layer_norm_3.weight", GGML_TYPE_F32),
+                require_tensor(model, prefix + "layer_norm_3.bias", GGML_TYPE_F32));
+        tensor2d ff = decoder_feed_forward(
+                norm,
+                require_tensor(model, prefix + "feed_forward.dense_in.weight"),
+                require_tensor(model, prefix + "feed_forward.dense_in.bias", GGML_TYPE_F32),
+                require_tensor(model, prefix + "feed_forward.dense_out.weight"),
+                require_tensor(model, prefix + "feed_forward.dense_out.bias", GGML_TYPE_F32),
+                model.decoder.hidden_act,
+                n_threads,
+                runtime);
+        hidden = add_scaled(hidden, ff, 1.0f);
     }
 
     if (!need_logits) {
@@ -2312,16 +2150,12 @@ static std::vector<float> decoder_step(
         lm_head_weight = require_tensor(model, "decoder.embedding.token_embedding.weight");
     }
 
-    tensor2d logits;
-    {
-        scope_timer timer(timer_ptr(runtime, &timing_breakdown_us::lm_head));
-        logits = eval_linear(
-                lm_head_weight,
-                require_tensor(model, "lm_head.bias", GGML_TYPE_F32),
-                hidden,
-                n_threads,
-                runtime);
-    }
+    tensor2d logits = eval_linear(
+            lm_head_weight,
+            require_tensor(model, "lm_head.bias", GGML_TYPE_F32),
+            hidden,
+            n_threads,
+            runtime);
 
     std::vector<float> out(size_t(logits.n0));
     for (int32_t i = 0; i < logits.n0; ++i) {
@@ -2742,33 +2576,6 @@ std::string tokenizer::detokenize(const std::vector<int32_t> & ids) const {
     return sanitize_utf8(bytes);
 }
 
-bool probe_model_architecture(const std::string & path_model, std::string & architecture, std::string * error) {
-    architecture.clear();
-
-    try {
-        struct gguf_init_params params = {
-            /*.no_alloc =*/ true,
-            /*.ctx      =*/ nullptr,
-        };
-
-        gguf_ptr gguf(gguf_init_from_file(path_model.c_str(), params));
-        if (!gguf) {
-            throw std::runtime_error(format("failed to open model '%s'", path_model.c_str()));
-        }
-
-        const int64_t kid = gguf_find_key(gguf.get(), GGUF_ARCH_KEY);
-        if (kid >= 0 && gguf_get_kv_type(gguf.get(), kid) == GGUF_TYPE_STRING) {
-            architecture = gguf_get_val_str(gguf.get(), kid);
-        }
-        return true;
-    } catch (const std::exception & ex) {
-        if (error) {
-            *error = ex.what();
-        }
-        return false;
-    }
-}
-
 bool load_model(const std::string & path_model, model & out, std::string & error) {
     free_model(out);
 
@@ -2906,18 +2713,10 @@ static bool run_inference(
         model & model,
         const std::vector<float> & pcmf32,
         const transcribe_params & params,
-        transcribe_profile * profile,
-        debug_outputs * outputs,
         std::string & text,
         std::string & error) {
     text.clear();
     error.clear();
-    if (outputs != nullptr) {
-        *outputs = debug_outputs();
-    }
-    if (profile != nullptr) {
-        *profile = transcribe_profile();
-    }
 
     try {
         if (!model.vocab.is_language_supported(params.language)) {
@@ -2939,44 +2738,17 @@ static bool run_inference(
         const int32_t n_threads = std::max(1, params.n_threads);
         configure_blas_threads_for_inference(n_threads);
         inference_runtime runtime;
-        runtime.profile = profile;
-        encoder_trace trace = run_encoder_trace(model, pcmf32, n_threads, &runtime);
-        tensor2d decoder_memory = trace.encoder_projected;
+        int32_t encoder_length = 0;
+        tensor2d decoder_memory = run_encoder(model, pcmf32, n_threads, encoder_length, &runtime);
         std::vector<cross_kv_cache> cross_kv;
-        {
-            scope_timer timer(timer_ptr(&runtime, &timing_breakdown_us::cross_kv_build));
-            cross_kv = build_cross_kv(model, decoder_memory, n_threads, &runtime);
-        }
+        cross_kv = build_cross_kv(model, decoder_memory, n_threads, &runtime);
         std::vector<self_kv_cache> self_kv = build_self_kv(model);
 
         const std::vector<int32_t> prompt = model.vocab.build_prompt(params.language, params.punctuation);
         const int32_t eos_token_id = model.vocab.special_token_id("<|endoftext|>");
-        if (profile != nullptr) {
-            profile->prompt_token_count = (int32_t) prompt.size();
-        }
 
         if ((int32_t) prompt.size() > model.decoder.max_sequence_length) {
             throw std::runtime_error("decoder prompt exceeds decoder max sequence length");
-        }
-
-        if (outputs != nullptr) {
-            outputs->mel = matrix_output_from_tensor2d(trace.mel);
-            outputs->mel_len = trace.mel.n1;
-            outputs->subsampling_out = matrix_output_from_tensor2d(trace.subsampling_out);
-            outputs->subsampling_len = trace.subsampling_out.n1;
-            outputs->block0_after_ff1 = matrix_output_from_tensor2d(trace.block0_after_ff1);
-            outputs->block0_after_ff1_len = trace.block0_after_ff1.n1;
-            outputs->block0_after_attn = matrix_output_from_tensor2d(trace.block0_after_attn);
-            outputs->block0_after_attn_len = trace.block0_after_attn.n1;
-            outputs->block0_after_conv = matrix_output_from_tensor2d(trace.block0_after_conv);
-            outputs->block0_after_conv_len = trace.block0_after_conv.n1;
-            outputs->block0_out = matrix_output_from_tensor2d(trace.block0_out);
-            outputs->block0_out_len = trace.block0_out.n1;
-            outputs->encoder_out = matrix_output_from_tensor2d(trace.encoder_out);
-            outputs->encoder_out_len = trace.encoder_out.n1;
-            outputs->encoder_projected = matrix_output_from_tensor2d(trace.encoder_projected);
-            outputs->encoder_projected_len = trace.encoder_projected.n1;
-            outputs->prompt_ids = prompt;
         }
 
         std::vector<int32_t> generated;
@@ -2984,49 +2756,27 @@ static bool run_inference(
 
         int32_t current_position = 0;
         std::vector<float> logits;
-        {
-            scope_timer timer(timer_ptr(&runtime, &timing_breakdown_us::decoder_total));
-            for (size_t i = 0; i < prompt.size(); ++i) {
-                const bool need_logits = (i + 1 == prompt.size());
-                logits = decoder_step(model, prompt[i], current_position++, cross_kv, self_kv, n_threads, need_logits, &runtime);
-                if (profile != nullptr) {
-                    profile->decoder_step_count += 1;
-                }
-            }
+        for (size_t i = 0; i < prompt.size(); ++i) {
+            const bool need_logits = (i + 1 == prompt.size());
+            logits = decoder_step(model, prompt[i], current_position++, cross_kv, self_kv, n_threads, need_logits, &runtime);
+        }
 
-            if (outputs != nullptr) {
-                outputs->first_step_logits = logits;
+        const int32_t remaining = std::max(0, model.decoder.max_sequence_length - current_position);
+        const int32_t max_new_tokens = std::min(params.max_new_tokens, remaining);
+        for (int32_t i = 0; i < max_new_tokens; ++i) {
+            const int32_t next = argmax(logits);
+            if (next == eos_token_id) {
+                break;
             }
-
-            const int32_t remaining = std::max(0, model.decoder.max_sequence_length - current_position);
-            const int32_t max_new_tokens = std::min(params.max_new_tokens, remaining);
-            for (int32_t i = 0; i < max_new_tokens; ++i) {
-                const int32_t next = argmax(logits);
-                if (next == eos_token_id) {
-                    break;
-                }
-                generated.push_back(next);
-                logits = decoder_step(model, next, current_position++, cross_kv, self_kv, n_threads, true, &runtime);
-                if (profile != nullptr) {
-                    profile->decoder_step_count += 1;
-                }
-            }
+            generated.push_back(next);
+            logits = decoder_step(model, next, current_position++, cross_kv, self_kv, n_threads, true, &runtime);
         }
 
         text = model.vocab.detokenize(generated);
-        if (profile != nullptr) {
-            profile->greedy_token_count = (int32_t) generated.size();
-        }
-        if (outputs != nullptr) {
-            outputs->greedy_ids = generated;
-            outputs->text = text;
-        }
+        GGML_UNUSED(encoder_length);
         return true;
     } catch (const std::exception & ex) {
         error = ex.what();
-        if (outputs != nullptr) {
-            *outputs = debug_outputs();
-        }
         return false;
     }
 }
@@ -3037,27 +2787,7 @@ bool transcribe(
         const transcribe_params & params,
         std::string & text,
         std::string & error) {
-    return run_inference(model, pcmf32, params, nullptr, nullptr, text, error);
-}
-
-bool transcribe_with_profile(
-        model & model,
-        const std::vector<float> & pcmf32,
-        const transcribe_params & params,
-        transcribe_profile & profile,
-        std::string & text,
-        std::string & error) {
-    return run_inference(model, pcmf32, params, &profile, nullptr, text, error);
-}
-
-bool collect_debug_outputs(
-        model & model,
-        const std::vector<float> & pcmf32,
-        const transcribe_params & params,
-        debug_outputs & outputs,
-        std::string & error) {
-    std::string text;
-    return run_inference(model, pcmf32, params, nullptr, &outputs, text, error);
+    return run_inference(model, pcmf32, params, text, error);
 }
 
 } // namespace cohere
