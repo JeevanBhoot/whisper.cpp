@@ -12,6 +12,21 @@
 #include <memory>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
+
+#if defined(__has_include)
+#if __has_include(<Accelerate/Accelerate.h>)
+#include <Accelerate/Accelerate.h>
+#define COHERE_HAVE_CBLAS 1
+#elif __has_include(<cblas.h>)
+#include <cblas.h>
+#define COHERE_HAVE_CBLAS 1
+#endif
+#endif
+
+#ifndef COHERE_HAVE_CBLAS
+#define COHERE_HAVE_CBLAS 0
+#endif
 
 namespace cohere {
 namespace {
@@ -40,6 +55,26 @@ struct ggml_context_deleter {
 
 typedef std::unique_ptr<struct gguf_context, gguf_context_deleter> gguf_ptr;
 typedef std::unique_ptr<struct ggml_context, ggml_context_deleter> ggml_ptr;
+
+struct scope_timer {
+    int64_t * target = nullptr;
+    int64_t start_us = 0;
+
+    explicit scope_timer(int64_t * target_) : target(target_), start_us(target_ ? ggml_time_us() : 0) {
+    }
+
+    ~scope_timer() {
+        if (target != nullptr) {
+            *target += ggml_time_us() - start_us;
+        }
+    }
+};
+
+static inline void add_counter(int64_t * value, int64_t delta = 1) {
+    if (value != nullptr) {
+        *value += delta;
+    }
+}
 
 struct tensor2d {
     int32_t n0 = 0;
@@ -101,6 +136,23 @@ struct self_kv_cache {
     int32_t length = 0;
 };
 
+struct linear_workspace {
+    ggml_ptr ctx;
+};
+
+struct inference_runtime {
+    transcribe_profile * profile = nullptr;
+    linear_workspace linear_ws;
+    std::map<int64_t, tensor2d> rel_pos_cache;
+    std::vector<uint8_t> vec_dot_input_buffer;
+};
+
+struct fft_trig_cache {
+    int32_t n = 0;
+    std::vector<float> sin_vals;
+    std::vector<float> cos_vals;
+};
+
 static std::string format(const char * fmt, ...) {
     char buf[2048];
     va_list args;
@@ -129,10 +181,126 @@ static ggml_ptr make_compute_ctx(size_t mem_size = SCRATCH_SIZE) {
     return ggml_ptr(ctx);
 }
 
-static void run_graph(struct ggml_context * ctx, struct ggml_tensor * output, int32_t n_threads) {
+static int64_t rel_pos_cache_key(int32_t d_model, int32_t length) {
+    return (int64_t(d_model) << 32) | uint32_t(length);
+}
+
+static int32_t choose_blas_thread_limit(int32_t n_threads) {
+    if (n_threads <= 1) {
+        return 1;
+    }
+
+    return std::max(1, std::min(4, n_threads / 2));
+}
+
+static void configure_blas_threads_for_inference(int32_t n_threads) {
+#if defined(__APPLE__) && COHERE_HAVE_CBLAS
+    struct blas_thread_state {
+        bool configured_by_runtime = false;
+        int32_t last_limit = -1;
+    };
+
+    static blas_thread_state state;
+    const int32_t limit = choose_blas_thread_limit(n_threads);
+    const char * env = std::getenv("VECLIB_MAXIMUM_THREADS");
+
+    if (env != nullptr && !state.configured_by_runtime) {
+        return;
+    }
+
+    if (state.configured_by_runtime && state.last_limit == limit) {
+        return;
+    }
+
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "%d", limit);
+    setenv("VECLIB_MAXIMUM_THREADS", buf, 1);
+    state.configured_by_runtime = true;
+    state.last_limit = limit;
+#else
+    (void) n_threads;
+#endif
+}
+
+static const fft_trig_cache & get_fft_trig_cache(int32_t n) {
+    static std::map<int32_t, fft_trig_cache> caches;
+    const std::map<int32_t, fft_trig_cache>::iterator it = caches.find(n);
+    if (it != caches.end()) {
+        return it->second;
+    }
+
+    fft_trig_cache cache;
+    cache.n = n;
+    cache.sin_vals.resize(size_t(n));
+    cache.cos_vals.resize(size_t(n));
+    for (int32_t i = 0; i < n; ++i) {
+        const double theta = (2.0 * M_PI * double(i)) / double(n);
+        cache.sin_vals[size_t(i)] = std::sin(theta);
+        cache.cos_vals[size_t(i)] = std::cos(theta);
+    }
+
+    return caches.emplace(n, std::move(cache)).first->second;
+}
+
+static linear_workspace make_linear_workspace(inference_runtime * runtime) {
+    linear_workspace ws;
+    ws.ctx = make_compute_ctx();
+    if (runtime != nullptr && runtime->profile != nullptr) {
+        add_counter(&runtime->profile->counters.ggml_context_creations);
+    }
+    return ws;
+}
+
+static struct ggml_context * begin_linear_workspace(inference_runtime * runtime) {
+    if (runtime == nullptr) {
+        return nullptr;
+    }
+    if (!runtime->linear_ws.ctx) {
+        runtime->linear_ws = make_linear_workspace(runtime);
+    } else {
+        ggml_reset(runtime->linear_ws.ctx.get());
+        if (runtime->profile != nullptr) {
+            add_counter(&runtime->profile->counters.ggml_context_resets);
+        }
+    }
+    return runtime->linear_ws.ctx.get();
+}
+
+static int64_t * counter_ptr(inference_runtime * runtime, int64_t overhead_counters::* member) {
+    if (runtime == nullptr || runtime->profile == nullptr) {
+        return nullptr;
+    }
+    return &(runtime->profile->counters.*member);
+}
+
+static int64_t * timer_ptr(inference_runtime * runtime, int64_t timing_breakdown_us::* member) {
+    if (runtime == nullptr || runtime->profile == nullptr) {
+        return nullptr;
+    }
+    return &(runtime->profile->timings_us.*member);
+}
+
+static void run_graph(struct ggml_context * ctx, struct ggml_tensor * output, int32_t n_threads, inference_runtime * runtime = nullptr) {
     struct ggml_cgraph * gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, output);
 
+    add_counter(counter_ptr(runtime, &overhead_counters::ggml_graph_launches));
+    if (ggml_graph_compute_with_ctx(ctx, gf, n_threads) != GGML_STATUS_SUCCESS) {
+        throw std::runtime_error("ggml graph execution failed");
+    }
+}
+
+static void run_graph_outputs(
+        struct ggml_context * ctx,
+        std::initializer_list<struct ggml_tensor *> outputs,
+        int32_t n_threads,
+        inference_runtime * runtime = nullptr) {
+    struct ggml_cgraph * gf = ggml_new_graph(ctx);
+    for (struct ggml_tensor * output : outputs) {
+        ggml_build_forward_expand(gf, output);
+    }
+
+    add_counter(counter_ptr(runtime, &overhead_counters::ggml_graph_launches));
     if (ggml_graph_compute_with_ctx(ctx, gf, n_threads) != GGML_STATUS_SUCCESS) {
         throw std::runtime_error("ggml graph execution failed");
     }
@@ -242,31 +410,71 @@ static void expect_tensor_shape(
     }
 }
 
-static float tensor_get_f32(const struct ggml_tensor * tensor, int32_t i0, int32_t i1 = 0, int32_t i2 = 0, int32_t i3 = 0) {
+static const float * tensor_data_f32(const struct ggml_tensor * tensor) {
+    if (tensor == nullptr || tensor->type != GGML_TYPE_F32 || !ggml_is_contiguous(tensor)) {
+        return nullptr;
+    }
+    return reinterpret_cast<const float *>(tensor->data);
+}
+
+static float tensor_get_f32(const struct ggml_tensor * tensor, int32_t i0, int32_t i1 = 0, int32_t i2 = 0, int32_t i3 = 0);
+
+static void copy_f32_from_tensor(const struct ggml_tensor * tensor, std::vector<float> & out) {
+    if (tensor->type == GGML_TYPE_F32 && ggml_is_contiguous(tensor)) {
+        std::memcpy(out.data(), tensor->data, out.size() * sizeof(float));
+        return;
+    }
+
+    if (tensor->type == GGML_TYPE_F16 && ggml_is_contiguous(tensor)) {
+        ggml_fp16_to_fp32_row(reinterpret_cast<const ggml_fp16_t *>(tensor->data), out.data(), (int64_t) out.size());
+        return;
+    }
+
+    if (ggml_n_dims(tensor) == 2) {
+        const int32_t n0 = (int32_t) tensor->ne[0];
+        const int32_t n1 = (int32_t) tensor->ne[1];
+        for (int32_t j = 0; j < n1; ++j) {
+            for (int32_t i = 0; i < n0; ++i) {
+                out[size_t(i) + size_t(n0) * size_t(j)] = tensor_get_f32(tensor, i, j, 0, 0);
+            }
+        }
+        return;
+    }
+
+    if (ggml_n_dims(tensor) == 4) {
+        const int32_t n0 = (int32_t) tensor->ne[0];
+        const int32_t n1 = (int32_t) tensor->ne[1];
+        const int32_t n2 = (int32_t) tensor->ne[2];
+        const int32_t n3 = (int32_t) tensor->ne[3];
+        size_t index = 0;
+        for (int32_t l = 0; l < n3; ++l) {
+            for (int32_t k = 0; k < n2; ++k) {
+                for (int32_t j = 0; j < n1; ++j) {
+                    for (int32_t i = 0; i < n0; ++i) {
+                        out[index++] = tensor_get_f32(tensor, i, j, k, l);
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    throw std::runtime_error("unsupported tensor rank for float copy");
+}
+
+static float tensor_get_f32(const struct ggml_tensor * tensor, int32_t i0, int32_t i1, int32_t i2, int32_t i3) {
     return ggml_get_f32_nd(tensor, i0, i1, i2, i3);
 }
 
 static tensor2d tensor_from_ggml_2d(const struct ggml_tensor * tensor) {
     tensor2d out((int32_t) tensor->ne[0], (int32_t) tensor->ne[1]);
-    for (int32_t j = 0; j < out.n1; ++j) {
-        for (int32_t i = 0; i < out.n0; ++i) {
-            out.at(i, j) = tensor_get_f32(tensor, i, j, 0, 0);
-        }
-    }
+    copy_f32_from_tensor(tensor, out.data);
     return out;
 }
 
 static tensor4d tensor_from_ggml_4d(const struct ggml_tensor * tensor) {
     tensor4d out((int32_t) tensor->ne[0], (int32_t) tensor->ne[1], (int32_t) tensor->ne[2], (int32_t) tensor->ne[3]);
-    for (int32_t n = 0; n < out.n3; ++n) {
-        for (int32_t c = 0; c < out.n2; ++c) {
-            for (int32_t y = 0; y < out.n1; ++y) {
-                for (int32_t x = 0; x < out.n0; ++x) {
-                    out.at(x, y, c, n) = tensor_get_f32(tensor, x, y, c, n);
-                }
-            }
-        }
-    }
+    copy_f32_from_tensor(tensor, out.data);
     return out;
 }
 
@@ -283,39 +491,169 @@ static matrix_output matrix_output_from_tensor2d(const tensor2d & tensor) {
     return out;
 }
 
-static struct ggml_tensor * create_input_tensor_2d(struct ggml_context * ctx, const tensor2d & input) {
-    struct ggml_tensor * tensor = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, input.n0, input.n1);
+static enum ggml_type matmul_input_type_from_weight(const struct ggml_tensor * weight) {
+    if (weight == nullptr) {
+        return GGML_TYPE_F32;
+    }
+
+    const struct ggml_type_traits_cpu * traits = ggml_get_type_traits_cpu(weight->type);
+    if (traits == nullptr) {
+        return GGML_TYPE_F32;
+    }
+
+    const enum ggml_type type = traits->vec_dot_type;
+    if (type == GGML_TYPE_F16 || type == GGML_TYPE_F32) {
+        return type;
+    }
+
+    return GGML_TYPE_F32;
+}
+
+static struct ggml_tensor * create_input_tensor_2d(
+        struct ggml_context * ctx,
+        const tensor2d & input,
+        enum ggml_type type,
+        inference_runtime * runtime = nullptr) {
+    struct ggml_tensor * tensor = ggml_new_tensor_2d(ctx, type, input.n0, input.n1);
     if (tensor == nullptr) {
         throw std::runtime_error("failed to allocate ggml input tensor");
     }
-    std::memcpy(tensor->data, input.data.data(), input.data.size() * sizeof(float));
+
+    if (type == GGML_TYPE_F32) {
+        std::memcpy(tensor->data, input.data.data(), input.data.size() * sizeof(float));
+    } else if (type == GGML_TYPE_F16) {
+        ggml_fp32_to_fp16_row(
+                input.data.data(),
+                reinterpret_cast<ggml_fp16_t *>(tensor->data),
+                (int64_t) input.data.size());
+    } else {
+        throw std::runtime_error("unsupported ggml input tensor type");
+    }
+
+    add_counter(counter_ptr(runtime, &overhead_counters::input_tensor_copies));
     return tensor;
 }
 
-static struct ggml_tensor * create_input_tensor_4d(struct ggml_context * ctx, const tensor4d & input) {
+static struct ggml_tensor * create_matmul_input_tensor_2d(
+        struct ggml_context * ctx,
+        const struct ggml_tensor * weight,
+        const tensor2d & input,
+        inference_runtime * runtime = nullptr) {
+    return create_input_tensor_2d(ctx, input, matmul_input_type_from_weight(weight), runtime);
+}
+
+static struct ggml_tensor * create_input_tensor_4d(struct ggml_context * ctx, const tensor4d & input, inference_runtime * runtime = nullptr) {
     struct ggml_tensor * tensor = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, input.n0, input.n1, input.n2, input.n3);
     if (tensor == nullptr) {
         throw std::runtime_error("failed to allocate ggml input tensor");
     }
     std::memcpy(tensor->data, input.data.data(), input.data.size() * sizeof(float));
+    add_counter(counter_ptr(runtime, &overhead_counters::input_tensor_copies));
     return tensor;
 }
 
-static tensor2d eval_linear(struct ggml_tensor * weight, const struct ggml_tensor * bias, const tensor2d & input, int32_t n_threads) {
-    ggml_ptr ctx = make_compute_ctx();
-    struct ggml_tensor * src = create_input_tensor_2d(ctx.get(), input);
-    struct ggml_tensor * cur = ggml_mul_mat(ctx.get(), weight, src);
-    run_graph(ctx.get(), cur, n_threads);
+static uint8_t * get_vec_dot_input_buffer(inference_runtime * runtime, size_t bytes) {
+    if (runtime != nullptr) {
+        if (runtime->vec_dot_input_buffer.size() < bytes) {
+            runtime->vec_dot_input_buffer.resize(bytes);
+        }
+        return runtime->vec_dot_input_buffer.data();
+    }
+
+    static thread_local std::vector<uint8_t> fallback;
+    if (fallback.size() < bytes) {
+        fallback.resize(bytes);
+    }
+    return fallback.data();
+}
+
+static bool can_use_vec_dot_linear(const struct ggml_tensor * weight, const tensor2d & input) {
+    if (input.n1 != 1 || weight == nullptr || ggml_n_dims(weight) != 2 || !ggml_is_contiguous(weight)) {
+        return false;
+    }
+
+    if (weight->type != GGML_TYPE_F16 && weight->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    return weight->ne[1] <= 8192;
+}
+
+static tensor2d eval_linear_vec_dot(
+        const struct ggml_tensor * weight,
+        const struct ggml_tensor * bias,
+        const tensor2d & input,
+        inference_runtime * runtime = nullptr) {
+    const int32_t in_dim = input.n0;
+    const int32_t out_dim = (int32_t) weight->ne[1];
+
+    const struct ggml_type_traits_cpu * weight_traits = ggml_get_type_traits_cpu(weight->type);
+    if (weight_traits == nullptr || weight_traits->vec_dot == nullptr) {
+        throw std::runtime_error("missing ggml vec_dot for linear weight type");
+    }
+
+    const enum ggml_type vec_type = weight_traits->vec_dot_type;
+    const struct ggml_type_traits_cpu * vec_traits = ggml_get_type_traits_cpu(vec_type);
+    if (vec_traits == nullptr || vec_traits->from_float == nullptr) {
+        throw std::runtime_error("missing ggml from_float for vec_dot input type");
+    }
+
+    const size_t input_bytes = ggml_row_size(vec_type, in_dim);
+    uint8_t * input_buf = get_vec_dot_input_buffer(runtime, input_bytes);
+    vec_traits->from_float(input.data.data(), input_buf, in_dim);
+
+    const float * bias_data = tensor_data_f32(bias);
+    const char * weight_data = reinterpret_cast<const char *>(weight->data);
+    const size_t row_size = size_t(weight->nb[1]);
+
+    tensor2d out(out_dim, 1);
+    for (int32_t oc = 0; oc < out_dim; ++oc) {
+        float value = 0.0f;
+        weight_traits->vec_dot(
+                in_dim,
+                &value,
+                0,
+                weight_data + row_size * size_t(oc),
+                0,
+                input_buf,
+                0,
+                1);
+        const float b = bias_data ? bias_data[oc] : (bias ? tensor_get_f32(bias, oc) : 0.0f);
+        out.at(oc, 0) = value + b;
+    }
+
+    return out;
+}
+
+static tensor2d eval_linear(
+        struct ggml_tensor * weight,
+        const struct ggml_tensor * bias,
+        const tensor2d & input,
+        int32_t n_threads,
+        inference_runtime * runtime = nullptr) {
+    add_counter(counter_ptr(runtime, &overhead_counters::eval_linear_calls));
+
+    if (can_use_vec_dot_linear(weight, input)) {
+        return eval_linear_vec_dot(weight, bias, input, runtime);
+    }
+
+    ggml_ptr ctx_holder;
+    struct ggml_context * ctx = begin_linear_workspace(runtime);
+    if (ctx == nullptr) {
+        ctx_holder = make_compute_ctx();
+        ctx = ctx_holder.get();
+    }
+
+    struct ggml_tensor * src = create_matmul_input_tensor_2d(ctx, weight, input, runtime);
+    struct ggml_tensor * cur = ggml_mul_mat(ctx, weight, src);
+    if (bias != nullptr) {
+        struct ggml_tensor * bias2 = ggml_reshape_2d(ctx, const_cast<struct ggml_tensor *>(bias), bias->ne[0], 1);
+        cur = ggml_add(ctx, cur, ggml_repeat(ctx, bias2, cur));
+    }
+    run_graph(ctx, cur, n_threads, runtime);
 
     tensor2d out = tensor_from_ggml_2d(cur);
-
-    if (bias != nullptr) {
-        for (int32_t col = 0; col < out.n1; ++col) {
-            for (int32_t row = 0; row < out.n0; ++row) {
-                out.at(row, col) += tensor_get_f32(bias, row);
-            }
-        }
-    }
+    add_counter(counter_ptr(runtime, &overhead_counters::output_tensor_copies));
 
     return out;
 }
@@ -324,22 +662,140 @@ static tensor2d eval_linear_from_rank3_weight(
         struct ggml_tensor * weight,
         const struct ggml_tensor * bias,
         const tensor2d & input,
-        int32_t n_threads) {
-    ggml_ptr ctx = make_compute_ctx();
-    struct ggml_tensor * src = create_input_tensor_2d(ctx.get(), input);
-    struct ggml_tensor * w2 = ggml_reshape_2d(ctx.get(), weight, weight->ne[0] * weight->ne[1], weight->ne[2]);
-    struct ggml_tensor * cur = ggml_mul_mat(ctx.get(), w2, src);
-    run_graph(ctx.get(), cur, n_threads);
+        int32_t n_threads,
+        inference_runtime * runtime = nullptr) {
+    add_counter(counter_ptr(runtime, &overhead_counters::eval_linear_rank3_calls));
+
+    ggml_ptr ctx_holder;
+    struct ggml_context * ctx = begin_linear_workspace(runtime);
+    if (ctx == nullptr) {
+        ctx_holder = make_compute_ctx();
+        ctx = ctx_holder.get();
+    }
+
+    struct ggml_tensor * src = create_matmul_input_tensor_2d(ctx, weight, input, runtime);
+    struct ggml_tensor * w2 = ggml_reshape_2d(ctx, weight, weight->ne[0] * weight->ne[1], weight->ne[2]);
+    struct ggml_tensor * cur = ggml_mul_mat(ctx, w2, src);
+    if (bias != nullptr) {
+        struct ggml_tensor * bias2 = ggml_reshape_2d(ctx, const_cast<struct ggml_tensor *>(bias), bias->ne[0], 1);
+        cur = ggml_add(ctx, cur, ggml_repeat(ctx, bias2, cur));
+    }
+    run_graph(ctx, cur, n_threads, runtime);
 
     tensor2d out = tensor_from_ggml_2d(cur);
+    add_counter(counter_ptr(runtime, &overhead_counters::output_tensor_copies));
 
-    if (bias != nullptr) {
-        for (int32_t col = 0; col < out.n1; ++col) {
-            for (int32_t row = 0; row < out.n0; ++row) {
-                out.at(row, col) += tensor_get_f32(bias, row);
-            }
-        }
+    return out;
+}
+
+static tensor2d eval_linear_from_rank4_weight(
+        struct ggml_tensor * weight,
+        const struct ggml_tensor * bias,
+        const tensor2d & input,
+        int32_t n_threads,
+        inference_runtime * runtime = nullptr) {
+    add_counter(counter_ptr(runtime, &overhead_counters::eval_linear_rank3_calls));
+
+    ggml_ptr ctx_holder;
+    struct ggml_context * ctx = begin_linear_workspace(runtime);
+    if (ctx == nullptr) {
+        ctx_holder = make_compute_ctx();
+        ctx = ctx_holder.get();
     }
+
+    struct ggml_tensor * src = create_matmul_input_tensor_2d(ctx, weight, input, runtime);
+    struct ggml_tensor * w2 = ggml_reshape_2d(ctx, weight, weight->ne[0] * weight->ne[1] * weight->ne[2], weight->ne[3]);
+    struct ggml_tensor * cur = ggml_mul_mat(ctx, w2, src);
+    if (bias != nullptr) {
+        struct ggml_tensor * bias2 = ggml_reshape_2d(ctx, const_cast<struct ggml_tensor *>(bias), bias->ne[0], 1);
+        cur = ggml_add(ctx, cur, ggml_repeat(ctx, bias2, cur));
+    }
+    run_graph(ctx, cur, n_threads, runtime);
+
+    tensor2d out = tensor_from_ggml_2d(cur);
+    add_counter(counter_ptr(runtime, &overhead_counters::output_tensor_copies));
+
+    return out;
+}
+
+static struct ggml_tensor * apply_activation_graph(
+        struct ggml_context * ctx,
+        struct ggml_tensor * input,
+        const std::string & act) {
+    if (act == "relu") {
+        return ggml_relu(ctx, input);
+    }
+
+    if (act == "silu" || act == "swish") {
+        return ggml_silu(ctx, input);
+    }
+
+    throw std::runtime_error(format("unsupported activation '%s'", act.c_str()));
+}
+
+static void apply_activation(tensor2d & x, const std::string & act);
+
+static struct ggml_tensor * build_linear_graph(
+        struct ggml_context * ctx,
+        struct ggml_tensor * weight,
+        const struct ggml_tensor * bias,
+        struct ggml_tensor * src) {
+    struct ggml_tensor * cur = ggml_mul_mat(ctx, weight, src);
+    if (bias != nullptr) {
+        struct ggml_tensor * bias2 = ggml_reshape_2d(ctx, const_cast<struct ggml_tensor *>(bias), bias->ne[0], 1);
+        cur = ggml_add(ctx, cur, ggml_repeat(ctx, bias2, cur));
+    }
+    return cur;
+}
+
+static tensor2d eval_linear_activation_linear(
+        struct ggml_tensor * w1,
+        const struct ggml_tensor * b1,
+        struct ggml_tensor * w2,
+        const struct ggml_tensor * b2,
+        const tensor2d & input,
+        const std::string & act,
+        int32_t n_threads,
+        inference_runtime * runtime = nullptr) {
+    add_counter(counter_ptr(runtime, &overhead_counters::eval_linear_calls), 2);
+
+    if (input.n1 == 1 &&
+            can_use_vec_dot_linear(w1, input) &&
+            ggml_is_contiguous(w2) &&
+            (w2->type == GGML_TYPE_F16 || w2->type == GGML_TYPE_F32) &&
+            w2->ne[0] == w1->ne[1] &&
+            w2->ne[1] <= 8192) {
+        tensor2d hidden = eval_linear_vec_dot(w1, b1, input, runtime);
+        apply_activation(hidden, act);
+        return eval_linear_vec_dot(w2, b2, hidden, runtime);
+    }
+
+    ggml_ptr ctx_holder;
+    struct ggml_context * ctx = begin_linear_workspace(runtime);
+    if (ctx == nullptr) {
+        ctx_holder = make_compute_ctx();
+        ctx = ctx_holder.get();
+    }
+
+    struct ggml_tensor * src = create_matmul_input_tensor_2d(ctx, w1, input, runtime);
+    struct ggml_tensor * cur = ggml_mul_mat(ctx, w1, src);
+    if (b1 != nullptr) {
+        struct ggml_tensor * bias1 = ggml_reshape_2d(ctx, const_cast<struct ggml_tensor *>(b1), b1->ne[0], 1);
+        cur = ggml_add(ctx, cur, ggml_repeat(ctx, bias1, cur));
+    }
+
+    cur = apply_activation_graph(ctx, cur, act);
+
+    cur = ggml_mul_mat(ctx, w2, cur);
+    if (b2 != nullptr) {
+        struct ggml_tensor * bias2 = ggml_reshape_2d(ctx, const_cast<struct ggml_tensor *>(b2), b2->ne[0], 1);
+        cur = ggml_add(ctx, cur, ggml_repeat(ctx, bias2, cur));
+    }
+
+    run_graph(ctx, cur, n_threads, runtime);
+
+    tensor2d out = tensor_from_ggml_2d(cur);
+    add_counter(counter_ptr(runtime, &overhead_counters::output_tensor_copies));
 
     return out;
 }
@@ -393,6 +849,51 @@ static tensor4d eval_conv2d(
                     }
                     out.at(ox, oy, oc, n) = acc;
                 }
+            }
+        }
+    }
+
+    return out;
+}
+
+static tensor4d eval_conv2d_pointwise(
+        struct ggml_tensor * weight,
+        const struct ggml_tensor * bias,
+        const tensor4d & input,
+        int32_t n_threads,
+        inference_runtime * runtime = nullptr) {
+    if (weight->ne[0] != 1 || weight->ne[1] != 1) {
+        throw std::runtime_error("pointwise conv helper expects a 1x1 kernel");
+    }
+
+    const int32_t out_channels = (int32_t) weight->ne[3];
+    const int32_t in_channels = input.n2;
+    const int32_t positions = input.n0 * input.n1 * input.n3;
+
+    tensor2d flat(in_channels, positions);
+    int32_t pos = 0;
+    for (int32_t n = 0; n < input.n3; ++n) {
+        for (int32_t y = 0; y < input.n1; ++y) {
+            for (int32_t x = 0; x < input.n0; ++x) {
+                for (int32_t c = 0; c < in_channels; ++c) {
+                    flat.at(c, pos) = input.at(x, y, c, n);
+                }
+                ++pos;
+            }
+        }
+    }
+
+    tensor2d projected = eval_linear_from_rank4_weight(weight, bias, flat, n_threads, runtime);
+    tensor4d out(input.n0, input.n1, out_channels, input.n3);
+
+    pos = 0;
+    for (int32_t n = 0; n < input.n3; ++n) {
+        for (int32_t y = 0; y < input.n1; ++y) {
+            for (int32_t x = 0; x < input.n0; ++x) {
+                for (int32_t c = 0; c < out_channels; ++c) {
+                    out.at(x, y, c, n) = projected.at(c, pos);
+                }
+                ++pos;
             }
         }
     }
@@ -512,6 +1013,8 @@ static tensor2d add_scaled(const tensor2d & a, const tensor2d & b, float scale) 
 
 static tensor2d layer_norm(const tensor2d & x, const struct ggml_tensor * weight, const struct ggml_tensor * bias) {
     tensor2d out(x.n0, x.n1);
+    const float * weight_data = tensor_data_f32(weight);
+    const float * bias_data = tensor_data_f32(bias);
 
     for (int32_t col = 0; col < x.n1; ++col) {
         double mean = 0.0;
@@ -530,8 +1033,8 @@ static tensor2d layer_norm(const tensor2d & x, const struct ggml_tensor * weight
 
         for (int32_t row = 0; row < x.n0; ++row) {
             const float norm = (x.at(row, col) - float(mean)) * inv_std;
-            const float w = tensor_get_f32(weight, row);
-            const float b = bias ? tensor_get_f32(bias, row) : 0.0f;
+            const float w = weight_data ? weight_data[row] : tensor_get_f32(weight, row);
+            const float b = bias_data ? bias_data[row] : (bias ? tensor_get_f32(bias, row) : 0.0f);
             out.at(row, col) = norm * w + b;
         }
     }
@@ -545,10 +1048,9 @@ static tensor2d feed_forward(
         const struct ggml_tensor * b1,
         struct ggml_tensor * w2,
         const struct ggml_tensor * b2,
-        int32_t n_threads) {
-    tensor2d cur = eval_linear(w1, b1, x, n_threads);
-    apply_silu(cur);
-    return eval_linear(w2, b2, cur, n_threads);
+        int32_t n_threads,
+        inference_runtime * runtime = nullptr) {
+    return eval_linear_activation_linear(w1, b1, w2, b2, x, "silu", n_threads, runtime);
 }
 
 static tensor2d decoder_feed_forward(
@@ -558,10 +1060,9 @@ static tensor2d decoder_feed_forward(
         struct ggml_tensor * w2,
         const struct ggml_tensor * b2,
         const std::string & act,
-        int32_t n_threads) {
-    tensor2d cur = eval_linear(w1, b1, x, n_threads);
-    apply_activation(cur, act);
-    return eval_linear(w2, b2, cur, n_threads);
+        int32_t n_threads,
+        inference_runtime * runtime = nullptr) {
+    return eval_linear_activation_linear(w1, b1, w2, b2, x, act, n_threads, runtime);
 }
 
 static tensor2d glu(const tensor2d & x) {
@@ -589,11 +1090,25 @@ static tensor2d depthwise_conv1d(
     const int32_t kernel = (int32_t) weight->ne[0];
     const int32_t channels = x.n0;
     const int32_t pad = kernel / 2;
+    const float * bias_data = tensor_data_f32(bias);
+    const float * weight_f32 = weight->type == GGML_TYPE_F32 && ggml_is_contiguous(weight)
+            ? reinterpret_cast<const float *>(weight->data)
+            : nullptr;
+    const ggml_fp16_t * weight_f16 = weight->type == GGML_TYPE_F16 && ggml_is_contiguous(weight)
+            ? reinterpret_cast<const ggml_fp16_t *>(weight->data)
+            : nullptr;
+    std::vector<float> weight_cache;
+
+    if (weight_f32 == nullptr && weight_f16 != nullptr) {
+        weight_cache.resize(size_t(kernel) * size_t(channels));
+        ggml_fp16_to_fp32_row(weight_f16, weight_cache.data(), (int64_t) weight_cache.size());
+        weight_f32 = weight_cache.data();
+        weight_f16 = nullptr;
+    }
 
     tensor2d out(x.n0, x.n1);
-
     for (int32_t c = 0; c < channels; ++c) {
-        const float b = bias ? tensor_get_f32(bias, c) : 0.0f;
+        const float b = bias_data ? bias_data[c] : (bias ? tensor_get_f32(bias, c) : 0.0f);
         for (int32_t t = 0; t < x.n1; ++t) {
             float sum = b;
             for (int32_t k = 0; k < kernel; ++k) {
@@ -601,7 +1116,10 @@ static tensor2d depthwise_conv1d(
                 if (src_t < 0 || src_t >= x.n1) {
                     continue;
                 }
-                sum += tensor_get_f32(weight, k, 0, c) * x.at(c, src_t);
+                const size_t index = size_t(k) + size_t(kernel) * size_t(c);
+                const float w = weight_f32 ? weight_f32[index]
+                        : (weight_f16 ? ggml_fp16_to_fp32(weight_f16[index]) : tensor_get_f32(weight, k, 0, c));
+                sum += w * x.at(c, src_t);
             }
             out.at(c, t) = sum;
         }
@@ -649,6 +1167,24 @@ static tensor2d build_relative_positional_encoding(int32_t d_model, int32_t leng
     return out;
 }
 
+static const tensor2d & get_relative_positional_encoding(inference_runtime * runtime, int32_t d_model, int32_t length) {
+    if (runtime == nullptr) {
+        static thread_local tensor2d fallback;
+        fallback = build_relative_positional_encoding(d_model, length);
+        return fallback;
+    }
+
+    const int64_t key = rel_pos_cache_key(d_model, length);
+    const std::map<int64_t, tensor2d>::iterator it = runtime->rel_pos_cache.find(key);
+    if (it != runtime->rel_pos_cache.end()) {
+        add_counter(counter_ptr(runtime, &overhead_counters::rel_pos_cache_hits));
+        return it->second;
+    }
+
+    add_counter(counter_ptr(runtime, &overhead_counters::rel_pos_cache_misses));
+    return runtime->rel_pos_cache.emplace(key, build_relative_positional_encoding(d_model, length)).first->second;
+}
+
 static tensor2d encoder_self_attention(
         const tensor2d & x,
         struct ggml_tensor * q_weight,
@@ -663,24 +1199,155 @@ static tensor2d encoder_self_attention(
         const struct ggml_tensor * pos_bias_u,
         const struct ggml_tensor * pos_bias_v,
         int32_t n_heads,
-        int32_t n_threads) {
+        int32_t n_threads,
+        inference_runtime * runtime = nullptr) {
     const int32_t hidden = x.n0;
     const int32_t length = x.n1;
     const int32_t head_dim = hidden / n_heads;
     const float scale = 1.0f / std::sqrt(float(head_dim));
 
-    tensor2d q = eval_linear(q_weight, q_bias, x, n_threads);
-    tensor2d k = eval_linear(k_weight, k_bias, x, n_threads);
-    tensor2d v = eval_linear(v_weight, v_bias, x, n_threads);
-    tensor2d p = eval_linear(pos_weight, nullptr, build_relative_positional_encoding(hidden, length), n_threads);
+    ggml_ptr ctx_holder;
+    struct ggml_context * ctx = begin_linear_workspace(runtime);
+    if (ctx == nullptr) {
+        ctx_holder = make_compute_ctx();
+        ctx = ctx_holder.get();
+    }
+
+    const tensor2d & rel_pos = get_relative_positional_encoding(runtime, hidden, length);
+    struct ggml_tensor * src = create_matmul_input_tensor_2d(ctx, q_weight, x, runtime);
+    struct ggml_tensor * pos_src = create_matmul_input_tensor_2d(ctx, pos_weight, rel_pos, runtime);
+
+    struct ggml_tensor * q_tensor = build_linear_graph(ctx, q_weight, q_bias, src);
+    struct ggml_tensor * k_tensor = build_linear_graph(ctx, k_weight, k_bias, src);
+    struct ggml_tensor * v_tensor = build_linear_graph(ctx, v_weight, v_bias, src);
+    struct ggml_tensor * p_tensor = build_linear_graph(ctx, pos_weight, nullptr, pos_src);
+    run_graph_outputs(ctx, { q_tensor, k_tensor, v_tensor, p_tensor }, n_threads, runtime);
+
+    tensor2d q = tensor_from_ggml_2d(q_tensor);
+    tensor2d k = tensor_from_ggml_2d(k_tensor);
+    tensor2d v = tensor_from_ggml_2d(v_tensor);
+    tensor2d p = tensor_from_ggml_2d(p_tensor);
+    add_counter(counter_ptr(runtime, &overhead_counters::output_tensor_copies), 4);
 
     tensor2d attn(hidden, length);
+    const float * pos_u = tensor_data_f32(pos_bias_u);
+    const float * pos_v = tensor_data_f32(pos_bias_v);
 
-    std::vector<float> scores(length);
-    std::vector<float> probs(length);
+#if COHERE_HAVE_CBLAS
+    const float * q_data = q.data.data();
+    const float * k_data = k.data.data();
+    const float * v_data = v.data.data();
+    const float * p_data = p.data.data();
+    float * attn_data = attn.data.data();
+
+    std::vector<float> bias_u_vals{std::vector<float>(size_t(head_dim))};
+    std::vector<float> bias_v_vals{std::vector<float>(size_t(head_dim))};
+    std::vector<float> q_u(size_t(head_dim) * size_t(length));
+    std::vector<float> q_v(size_t(head_dim) * size_t(length));
+    std::vector<float> ac(size_t(length) * size_t(length));
+    std::vector<float> bd(size_t(length) * size_t(2 * length - 1));
+    std::vector<float> probs(size_t(length) * size_t(length));
+    std::vector<float> score_row{std::vector<float>(size_t(length))};
 
     for (int32_t h = 0; h < n_heads; ++h) {
         const int32_t base = h * head_dim;
+        const size_t bias_offset = size_t(head_dim) * size_t(h);
+
+        for (int32_t d = 0; d < head_dim; ++d) {
+            bias_u_vals[size_t(d)] = pos_u ? pos_u[bias_offset + size_t(d)] : tensor_get_f32(pos_bias_u, d, h);
+            bias_v_vals[size_t(d)] = pos_v ? pos_v[bias_offset + size_t(d)] : tensor_get_f32(pos_bias_v, d, h);
+        }
+
+        for (int32_t pos = 0; pos < length; ++pos) {
+            const float * q_col = q_data + size_t(base) + size_t(hidden) * size_t(pos);
+            float * q_u_col = q_u.data() + size_t(head_dim) * size_t(pos);
+            float * q_v_col = q_v.data() + size_t(head_dim) * size_t(pos);
+            for (int32_t d = 0; d < head_dim; ++d) {
+                const float value = q_col[d];
+                q_u_col[d] = value + bias_u_vals[size_t(d)];
+                q_v_col[d] = value + bias_v_vals[size_t(d)];
+            }
+        }
+
+        cblas_sgemm(
+                CblasColMajor,
+                CblasTrans,
+                CblasNoTrans,
+                length,
+                length,
+                head_dim,
+                1.0f,
+                q_u.data(),
+                head_dim,
+                k_data + base,
+                hidden,
+                0.0f,
+                ac.data(),
+                length);
+
+        cblas_sgemm(
+                CblasColMajor,
+                CblasTrans,
+                CblasNoTrans,
+                length,
+                2 * length - 1,
+                head_dim,
+                1.0f,
+                q_v.data(),
+                head_dim,
+                p_data + base,
+                hidden,
+                0.0f,
+                bd.data(),
+                length);
+
+        for (int32_t q_pos = 0; q_pos < length; ++q_pos) {
+            float max_score = -std::numeric_limits<float>::infinity();
+            for (int32_t k_pos = 0; k_pos < length; ++k_pos) {
+                const int32_t pos_index = (length - 1) - q_pos + k_pos;
+                const float score = (ac[size_t(q_pos) + size_t(length) * size_t(k_pos)] +
+                        bd[size_t(q_pos) + size_t(length) * size_t(pos_index)]) * scale;
+                score_row[size_t(k_pos)] = score;
+                if (score > max_score) {
+                    max_score = score;
+                }
+            }
+
+            float denom = 0.0f;
+            for (int32_t k_pos = 0; k_pos < length; ++k_pos) {
+                const float value = std::exp(score_row[size_t(k_pos)] - max_score);
+                probs[size_t(q_pos) + size_t(length) * size_t(k_pos)] = value;
+                denom += value;
+            }
+            denom = denom > 0.0f ? denom : 1.0f;
+
+            for (int32_t k_pos = 0; k_pos < length; ++k_pos) {
+                probs[size_t(q_pos) + size_t(length) * size_t(k_pos)] /= denom;
+            }
+        }
+
+        cblas_sgemm(
+                CblasColMajor,
+                CblasNoTrans,
+                CblasTrans,
+                head_dim,
+                length,
+                length,
+                1.0f,
+                v_data + base,
+                hidden,
+                probs.data(),
+                length,
+                0.0f,
+                attn_data + base,
+                hidden);
+    }
+#else
+    std::vector<float> scores(length);
+    std::vector<float> probs(length);
+    for (int32_t h = 0; h < n_heads; ++h) {
+        const int32_t base = h * head_dim;
+        const size_t bias_offset = size_t(head_dim) * size_t(h);
 
         for (int32_t q_pos = 0; q_pos < length; ++q_pos) {
             float max_score = -std::numeric_limits<float>::infinity();
@@ -692,8 +1359,10 @@ static tensor2d encoder_self_attention(
 
                 for (int32_t d = 0; d < head_dim; ++d) {
                     const int32_t idx = base + d;
-                    ac += (q.at(idx, q_pos) + tensor_get_f32(pos_bias_u, d, h)) * k.at(idx, k_pos);
-                    bd += (q.at(idx, q_pos) + tensor_get_f32(pos_bias_v, d, h)) * p.at(idx, pos_index);
+                    const float bias_u = pos_u ? pos_u[bias_offset + size_t(d)] : tensor_get_f32(pos_bias_u, d, h);
+                    const float bias_v = pos_v ? pos_v[bias_offset + size_t(d)] : tensor_get_f32(pos_bias_v, d, h);
+                    ac += (q.at(idx, q_pos) + bias_u) * k.at(idx, k_pos);
+                    bd += (q.at(idx, q_pos) + bias_v) * p.at(idx, pos_index);
                 }
 
                 scores[k_pos] = (ac + bd) * scale;
@@ -719,8 +1388,9 @@ static tensor2d encoder_self_attention(
             }
         }
     }
+#endif
 
-    return eval_linear(out_weight, out_bias, attn, n_threads);
+    return eval_linear(out_weight, out_bias, attn, n_threads, runtime);
 }
 
 static tensor2d conformer_convolution(
@@ -732,13 +1402,14 @@ static tensor2d conformer_convolution(
         struct ggml_tensor * pointwise2_w,
         const struct ggml_tensor * pointwise2_b,
         int32_t valid_length,
-        int32_t n_threads) {
-    tensor2d cur = eval_linear_from_rank3_weight(pointwise1_w, pointwise1_b, x, n_threads);
+        int32_t n_threads,
+        inference_runtime * runtime = nullptr) {
+    tensor2d cur = eval_linear_from_rank3_weight(pointwise1_w, pointwise1_b, x, n_threads, runtime);
     cur = glu(cur);
     zero_masked_positions(cur, valid_length);
     cur = depthwise_conv1d(cur, depthwise_w, depthwise_b);
     apply_silu(cur);
-    return eval_linear_from_rank3_weight(pointwise2_w, pointwise2_b, cur, n_threads);
+    return eval_linear_from_rank3_weight(pointwise2_w, pointwise2_b, cur, n_threads, runtime);
 }
 
 struct conformer_layer_trace {
@@ -754,12 +1425,14 @@ static tensor2d run_conformer_layer(
         const tensor2d & input,
         int32_t valid_length,
         int32_t n_threads,
+        inference_runtime * runtime = nullptr,
         conformer_layer_trace * trace = nullptr) {
     const std::string prefix = format("encoder.layers.%d.", layer_idx);
 
     tensor2d cur = input;
 
     {
+        scope_timer timer(timer_ptr(runtime, &timing_breakdown_us::encoder_ffn));
         tensor2d ff_in = layer_norm(
                 cur,
                 require_tensor(model, prefix + "norm_feed_forward1.weight", GGML_TYPE_F32),
@@ -771,8 +1444,8 @@ static tensor2d run_conformer_layer(
                 require_tensor(model, prefix + "feed_forward1.linear1.bias", GGML_TYPE_F32),
                 require_tensor(model, prefix + "feed_forward1.linear2.weight"),
                 require_tensor(model, prefix + "feed_forward1.linear2.bias", GGML_TYPE_F32),
-                n_threads);
-
+                n_threads,
+                runtime);
         cur = add_scaled(cur, ff_out, 0.5f);
         if (trace != nullptr) {
             trace->after_ff1 = cur;
@@ -780,6 +1453,7 @@ static tensor2d run_conformer_layer(
     }
 
     {
+        scope_timer timer(timer_ptr(runtime, &timing_breakdown_us::encoder_self_attention));
         tensor2d att_in = layer_norm(
                 cur,
                 require_tensor(model, prefix + "norm_self_att.weight", GGML_TYPE_F32),
@@ -799,7 +1473,8 @@ static tensor2d run_conformer_layer(
                 require_tensor(model, prefix + "self_attn.pos_bias_u", GGML_TYPE_F32),
                 require_tensor(model, prefix + "self_attn.pos_bias_v", GGML_TYPE_F32),
                 model.encoder.n_heads,
-                n_threads);
+                n_threads,
+                runtime);
 
         cur = add_scaled(cur, att_out, 1.0f);
         if (trace != nullptr) {
@@ -808,6 +1483,7 @@ static tensor2d run_conformer_layer(
     }
 
     {
+        scope_timer timer(timer_ptr(runtime, &timing_breakdown_us::encoder_conv));
         tensor2d conv_in = layer_norm(
                 cur,
                 require_tensor(model, prefix + "norm_conv.weight", GGML_TYPE_F32),
@@ -822,7 +1498,8 @@ static tensor2d run_conformer_layer(
                 require_tensor(model, prefix + "conv.pointwise_conv2.weight"),
                 require_tensor(model, prefix + "conv.pointwise_conv2.bias", GGML_TYPE_F32),
                 valid_length,
-                n_threads);
+                n_threads,
+                runtime);
 
         cur = add_scaled(cur, conv_out, 1.0f);
         if (trace != nullptr) {
@@ -831,6 +1508,7 @@ static tensor2d run_conformer_layer(
     }
 
     {
+        scope_timer timer(timer_ptr(runtime, &timing_breakdown_us::encoder_ffn));
         tensor2d ff_in = layer_norm(
                 cur,
                 require_tensor(model, prefix + "norm_feed_forward2.weight", GGML_TYPE_F32),
@@ -842,8 +1520,8 @@ static tensor2d run_conformer_layer(
                 require_tensor(model, prefix + "feed_forward2.linear1.bias", GGML_TYPE_F32),
                 require_tensor(model, prefix + "feed_forward2.linear2.weight"),
                 require_tensor(model, prefix + "feed_forward2.linear2.bias", GGML_TYPE_F32),
-                n_threads);
-
+                n_threads,
+                runtime);
         cur = add_scaled(cur, ff_out, 0.5f);
     }
 
@@ -861,7 +1539,8 @@ static tensor2d run_conv_subsampling(
         const model & model,
         const tensor2d & mel,
         int32_t valid_frames,
-        int32_t n_threads) {
+        int32_t n_threads,
+        inference_runtime * runtime = nullptr) {
     tensor4d x(model.encoder.feat_in, mel.n1, 1, 1);
     for (int32_t t = 0; t < mel.n1; ++t) {
         for (int32_t f = 0; f < mel.n0; ++f) {
@@ -887,11 +1566,12 @@ static tensor2d run_conv_subsampling(
             2, 2, 1, 1, n_threads);
     current_length = conv_output_length_1d(current_length, 3, 2, 2);
     zero_masked_time_positions(x, current_length);
-    x = eval_conv2d(
+    x = eval_conv2d_pointwise(
             require_tensor(model, "encoder.pre_encode.conv1_pw.weight"),
             require_tensor(model, "encoder.pre_encode.conv1_pw.bias", GGML_TYPE_F32),
             x,
-            1, 1, 0, 0, n_threads);
+            n_threads,
+            runtime);
     current_length = conv_output_length_1d(current_length, 1, 1, 0);
     zero_masked_time_positions(x, current_length);
     apply_relu(x);
@@ -903,11 +1583,12 @@ static tensor2d run_conv_subsampling(
             2, 2, 1, 1, n_threads);
     current_length = conv_output_length_1d(current_length, 3, 2, 2);
     zero_masked_time_positions(x, current_length);
-    x = eval_conv2d(
+    x = eval_conv2d_pointwise(
             require_tensor(model, "encoder.pre_encode.conv2_pw.weight"),
             require_tensor(model, "encoder.pre_encode.conv2_pw.bias", GGML_TYPE_F32),
             x,
-            1, 1, 0, 0, n_threads);
+            n_threads,
+            runtime);
     current_length = conv_output_length_1d(current_length, 1, 1, 0);
     zero_masked_time_positions(x, current_length);
     apply_relu(x);
@@ -929,7 +1610,8 @@ static tensor2d run_conv_subsampling(
             require_tensor(model, "encoder.pre_encode.out.weight"),
             require_tensor(model, "encoder.pre_encode.out.bias", GGML_TYPE_F32),
             flat,
-            n_threads);
+            n_threads,
+            runtime);
 }
 
 static std::vector<float> build_hann_window(int32_t length) {
@@ -940,22 +1622,67 @@ static std::vector<float> build_hann_window(int32_t length) {
     return out;
 }
 
-static void dft(const std::vector<float> & in, int32_t n, std::vector<float> & out) {
-    out.assign(size_t(n) * 2u, 0.0f);
+static void dft_cached(const float * in, int32_t n, float * out, const fft_trig_cache & cache) {
+    const int32_t step = cache.n / n;
+
     for (int32_t k = 0; k < n; ++k) {
-        double re = 0.0;
-        double im = 0.0;
+        float re = 0.0f;
+        float im = 0.0f;
         for (int32_t t = 0; t < n; ++t) {
-            const double phase = (2.0 * M_PI * double(k) * double(t)) / double(n);
-            re += double(in[t]) * std::cos(phase);
-            im -= double(in[t]) * std::sin(phase);
+            const int32_t idx = (k * t * step) % cache.n;
+            re += in[t] * cache.cos_vals[size_t(idx)];
+            im -= in[t] * cache.sin_vals[size_t(idx)];
         }
-        out[size_t(2 * k + 0)] = float(re);
-        out[size_t(2 * k + 1)] = float(im);
+        out[size_t(2 * k + 0)] = re;
+        out[size_t(2 * k + 1)] = im;
     }
 }
 
-static tensor2d compute_mel_features(const std::vector<float> & audio, const frontend_config & cfg) {
+static void fft_cached(float * in, int32_t n, float * out, const fft_trig_cache & cache) {
+    if (n == 1) {
+        out[0] = in[0];
+        out[1] = 0.0f;
+        return;
+    }
+
+    const int32_t half_n = n / 2;
+    if (n - half_n * 2 == 1) {
+        dft_cached(in, n, out, cache);
+        return;
+    }
+
+    float * even = in + n;
+    for (int32_t i = 0; i < half_n; ++i) {
+        even[i] = in[2 * i];
+    }
+    float * even_fft = out + 2 * n;
+    fft_cached(even, half_n, even_fft, cache);
+
+    float * odd = even;
+    for (int32_t i = 0; i < half_n; ++i) {
+        odd[i] = in[2 * i + 1];
+    }
+    float * odd_fft = even_fft + n;
+    fft_cached(odd, half_n, odd_fft, cache);
+
+    const int32_t step = cache.n / n;
+    for (int32_t k = 0; k < half_n; ++k) {
+        const int32_t idx = k * step;
+        const float re = cache.cos_vals[size_t(idx)];
+        const float im = -cache.sin_vals[size_t(idx)];
+
+        const float re_odd = odd_fft[2 * k + 0];
+        const float im_odd = odd_fft[2 * k + 1];
+
+        out[2 * k + 0] = even_fft[2 * k + 0] + re * re_odd - im * im_odd;
+        out[2 * k + 1] = even_fft[2 * k + 1] + re * im_odd + im * re_odd;
+
+        out[2 * (k + half_n) + 0] = even_fft[2 * k + 0] - re * re_odd + im * im_odd;
+        out[2 * (k + half_n) + 1] = even_fft[2 * k + 1] - re * im_odd - im * re_odd;
+    }
+}
+
+static tensor2d compute_mel_features(const std::vector<float> & audio, const frontend_config & cfg, int32_t n_threads) {
     if (audio.empty()) {
         throw std::runtime_error("audio is empty");
     }
@@ -980,40 +1707,72 @@ static tensor2d compute_mel_features(const std::vector<float> & audio, const fro
 
     const int32_t n_frames = 1 + int32_t((padded.size() - size_t(cfg.n_fft)) / size_t(cfg.hop_length));
     const int32_t n_freqs = cfg.n_fft / 2 + 1;
+    const fft_trig_cache & fft_cache = get_fft_trig_cache(cfg.n_fft);
 
     tensor2d mel(cfg.n_mels, n_frames);
-    std::vector<float> frame(size_t(cfg.n_fft), 0.0f);
-    std::vector<float> fft_out;
+    const int32_t worker_count = std::max(1, n_threads);
 
-    for (int32_t frame_idx = 0; frame_idx < n_frames; ++frame_idx) {
-        std::fill(frame.begin(), frame.end(), 0.0f);
-
-        const int32_t start = frame_idx * cfg.hop_length;
-
-        for (int32_t i = 0; i < cfg.win_length; ++i) {
-            const int32_t src = start + offset + i;
-            if (src >= 0 && src < (int32_t) padded.size()) {
-                frame[size_t(offset + i)] = padded[size_t(src)] * window[size_t(i)];
-            }
-        }
-
-        dft(frame, cfg.n_fft, fft_out);
-
+    auto worker = [&](int32_t ith) {
+        std::vector<float> fft_in(size_t(cfg.n_fft) * 2u, 0.0f);
+        std::vector<float> fft_out(size_t(cfg.n_fft) * 2u * 2u * 2u, 0.0f);
         std::vector<float> power(size_t(n_freqs), 0.0f);
-        for (int32_t k = 0; k < n_freqs; ++k) {
-            const float re = fft_out[size_t(2 * k + 0)];
-            const float im = fft_out[size_t(2 * k + 1)];
-            power[size_t(k)] = re * re + im * im;
-        }
 
-        for (int32_t m = 0; m < cfg.n_mels; ++m) {
-            double sum = 0.0;
-            const size_t off = size_t(m) * size_t(n_freqs);
-            for (int32_t k = 0; k < n_freqs; ++k) {
-                sum += double(cfg.mel_filters[off + size_t(k)]) * double(power[size_t(k)]);
+        for (int32_t frame_idx = ith; frame_idx < n_frames; frame_idx += worker_count) {
+            if (frame_idx >= valid_frames) {
+                for (int32_t m = 0; m < cfg.n_mels; ++m) {
+                    mel.at(m, frame_idx) = 0.0f;
+                }
+                continue;
             }
-            mel.at(m, frame_idx) = std::log(float(sum) + cfg.log_zero_guard);
+
+            std::fill(fft_in.begin(), fft_in.begin() + cfg.n_fft, 0.0f);
+
+            const int32_t start = frame_idx * cfg.hop_length;
+            for (int32_t i = 0; i < cfg.win_length; ++i) {
+                const int32_t src = start + offset + i;
+                if (src >= 0 && src < (int32_t) padded.size()) {
+                    fft_in[size_t(offset + i)] = padded[size_t(src)] * window[size_t(i)];
+                }
+            }
+
+            fft_cached(fft_in.data(), cfg.n_fft, fft_out.data(), fft_cache);
+
+            for (int32_t k = 0; k < n_freqs; ++k) {
+                const float re = fft_out[size_t(2 * k + 0)];
+                const float im = fft_out[size_t(2 * k + 1)];
+                power[size_t(k)] = re * re + im * im;
+            }
+
+            for (int32_t m = 0; m < cfg.n_mels; ++m) {
+                double sum = 0.0;
+                const float * filter = cfg.mel_filters.data() + size_t(m) * size_t(n_freqs);
+                int32_t k = 0;
+                for (; k < n_freqs - 3; k += 4) {
+                    sum +=
+                            double(power[size_t(k + 0)]) * double(filter[k + 0]) +
+                            double(power[size_t(k + 1)]) * double(filter[k + 1]) +
+                            double(power[size_t(k + 2)]) * double(filter[k + 2]) +
+                            double(power[size_t(k + 3)]) * double(filter[k + 3]);
+                }
+                for (; k < n_freqs; ++k) {
+                    sum += double(power[size_t(k)]) * double(filter[k]);
+                }
+                mel.at(m, frame_idx) = std::log(float(sum) + cfg.log_zero_guard);
+            }
         }
+    };
+
+    if (worker_count > 1) {
+        std::vector<std::thread> workers(size_t(worker_count - 1));
+        for (int32_t ith = 1; ith < worker_count; ++ith) {
+            workers[size_t(ith - 1)] = std::thread(worker, ith);
+        }
+        worker(0);
+        for (std::thread & t : workers) {
+            t.join();
+        }
+    } else {
+        worker(0);
     }
 
     if (cfg.normalize_per_feature) {
@@ -1039,12 +1798,6 @@ static tensor2d compute_mel_features(const std::vector<float> & audio, const fro
         }
     }
 
-    for (int32_t t = valid_frames; t < n_frames; ++t) {
-        for (int32_t m = 0; m < cfg.n_mels; ++m) {
-            mel.at(m, t) = 0.0f;
-        }
-    }
-
     return mel;
 }
 
@@ -1060,39 +1813,55 @@ struct encoder_trace {
     int32_t encoder_length = 0;
 };
 
-static tensor2d project_encoder_for_decoder(model & model, const tensor2d & encoder_out, int32_t n_threads);
+static tensor2d project_encoder_for_decoder(model & model, const tensor2d & encoder_out, int32_t n_threads, inference_runtime * runtime = nullptr);
 
-static encoder_trace run_encoder_trace(model & model, const std::vector<float> & pcmf32, int32_t n_threads) {
+static encoder_trace run_encoder_trace(model & model, const std::vector<float> & pcmf32, int32_t n_threads, inference_runtime * runtime = nullptr) {
     encoder_trace trace;
-    trace.mel = compute_mel_features(pcmf32, model.frontend);
+    {
+        scope_timer timer(timer_ptr(runtime, &timing_breakdown_us::frontend));
+        trace.mel = compute_mel_features(pcmf32, model.frontend, n_threads);
+    }
     const int32_t valid_mel_frames = std::max<int32_t>(1, int32_t(pcmf32.size() / size_t(model.frontend.hop_length)));
     trace.encoder_length = conv_subsampling_output_length(valid_mel_frames);
+    if (runtime != nullptr && runtime->profile != nullptr) {
+        runtime->profile->encoder_frame_count = trace.encoder_length;
+    }
 
-    trace.subsampling_out = run_conv_subsampling(model, trace.mel, valid_mel_frames, n_threads);
+    {
+        scope_timer timer(timer_ptr(runtime, &timing_breakdown_us::subsampling));
+        trace.subsampling_out = run_conv_subsampling(model, trace.mel, valid_mel_frames, n_threads, runtime);
+    }
     tensor2d cur = trace.subsampling_out;
-    for (int32_t il = 0; il < model.encoder.n_layers; ++il) {
-        conformer_layer_trace layer_trace;
-        cur = run_conformer_layer(
-                model,
-                il,
-                cur,
-                trace.encoder_length,
-                n_threads,
-                il == 0 ? &layer_trace : nullptr);
-        if (il == 0) {
-            trace.block0_after_ff1 = layer_trace.after_ff1;
-            trace.block0_after_attn = layer_trace.after_attn;
-            trace.block0_after_conv = layer_trace.after_conv;
-            trace.block0_out = layer_trace.out;
+    {
+        scope_timer timer(timer_ptr(runtime, &timing_breakdown_us::encoder_total));
+        for (int32_t il = 0; il < model.encoder.n_layers; ++il) {
+            conformer_layer_trace layer_trace;
+            cur = run_conformer_layer(
+                    model,
+                    il,
+                    cur,
+                    trace.encoder_length,
+                    n_threads,
+                    runtime,
+                    il == 0 ? &layer_trace : nullptr);
+            if (il == 0) {
+                trace.block0_after_ff1 = layer_trace.after_ff1;
+                trace.block0_after_attn = layer_trace.after_attn;
+                trace.block0_after_conv = layer_trace.after_conv;
+                trace.block0_out = layer_trace.out;
+            }
         }
     }
 
     trace.encoder_out = cur;
-    trace.encoder_projected = project_encoder_for_decoder(model, trace.encoder_out, n_threads);
+    {
+        scope_timer timer(timer_ptr(runtime, &timing_breakdown_us::encoder_projection));
+        trace.encoder_projected = project_encoder_for_decoder(model, trace.encoder_out, n_threads, runtime);
+    }
     return trace;
 }
 
-static tensor2d project_encoder_for_decoder(model & model, const tensor2d & encoder_out, int32_t n_threads) {
+static tensor2d project_encoder_for_decoder(model & model, const tensor2d & encoder_out, int32_t n_threads, inference_runtime * runtime) {
     if (!model.has_encoder_decoder_proj) {
         return encoder_out;
     }
@@ -1101,30 +1870,47 @@ static tensor2d project_encoder_for_decoder(model & model, const tensor2d & enco
             require_tensor(model, "encoder_decoder_proj.weight"),
             require_tensor(model, "encoder_decoder_proj.bias", GGML_TYPE_F32),
             encoder_out,
-            n_threads);
+            n_threads,
+            runtime);
 }
 
-static tensor2d run_encoder(model & model, const std::vector<float> & pcmf32, int32_t n_threads, int32_t & encoder_length) {
-    encoder_trace trace = run_encoder_trace(model, pcmf32, n_threads);
+static tensor2d run_encoder(model & model, const std::vector<float> & pcmf32, int32_t n_threads, int32_t & encoder_length, inference_runtime * runtime = nullptr) {
+    encoder_trace trace = run_encoder_trace(model, pcmf32, n_threads, runtime);
     encoder_length = trace.encoder_length;
     return trace.encoder_projected;
 }
 
 static tensor2d get_decoder_embedding(const model & model, int32_t token_id, int32_t position) {
     const struct ggml_tensor * token_embedding = require_tensor(model, "decoder.embedding.token_embedding.weight");
-    tensor2d out(model.decoder.hidden_size, 1);
+    const int32_t hidden = model.decoder.hidden_size;
+    tensor2d out(hidden, 1);
+    float * out_data = out.data.data();
 
-    const float pos_scale = 1.0f / std::sqrt(float(model.decoder.hidden_size));
-    for (int32_t i = 0; i < model.decoder.hidden_size; ++i) {
-        float value = tensor_get_f32(token_embedding, i, token_id);
+    if (token_embedding->type == GGML_TYPE_F32 && ggml_is_contiguous(token_embedding)) {
+        const float * token_col = reinterpret_cast<const float *>(
+                reinterpret_cast<const char *>(token_embedding->data) + size_t(token_id) * size_t(token_embedding->nb[1]));
+        std::memcpy(out_data, token_col, size_t(hidden) * sizeof(float));
+    } else if (token_embedding->type == GGML_TYPE_F16 && ggml_is_contiguous(token_embedding)) {
+        const ggml_fp16_t * token_col = reinterpret_cast<const ggml_fp16_t *>(
+                reinterpret_cast<const char *>(token_embedding->data) + size_t(token_id) * size_t(token_embedding->nb[1]));
+        ggml_fp16_to_fp32_row(token_col, out_data, hidden);
+    } else {
+        for (int32_t i = 0; i < hidden; ++i) {
+            out_data[i] = tensor_get_f32(token_embedding, i, token_id);
+        }
+    }
+
+    const float pos_scale = 1.0f / std::sqrt(float(hidden));
+    for (int32_t i = 0; i < hidden; ++i) {
+        float value = out_data[i];
         if ((i % 2) == 0) {
-            const float div = std::exp(-(std::log(10000.0f) / float(model.decoder.hidden_size)) * float(i));
+            const float div = std::exp(-(std::log(10000.0f) / float(hidden)) * float(i));
             value += std::sin(float(position) * div) * pos_scale;
         } else {
-            const float div = std::exp(-(std::log(10000.0f) / float(model.decoder.hidden_size)) * float(i - 1));
+            const float div = std::exp(-(std::log(10000.0f) / float(hidden)) * float(i - 1));
             value += std::cos(float(position) * div) * pos_scale;
         }
-        out.at(i, 0) = value;
+        out_data[i] = value;
     }
 
     return layer_norm(
@@ -1170,6 +1956,65 @@ static tensor2d decoder_self_attention_single(
     const float scale = 1.0f / std::sqrt(float(head_dim));
 
     tensor2d out(hidden, 1);
+#if COHERE_HAVE_CBLAS
+    const float * query_data = query.data.data();
+    const float * key_data = cache.key.data.data();
+    const float * value_data = cache.value.data.data();
+    float * out_data = out.data.data();
+    std::vector<float> scores{std::vector<float>(size_t(cache.length))};
+    std::vector<float> probs{std::vector<float>(size_t(cache.length))};
+
+    for (int32_t h = 0; h < n_heads; ++h) {
+        const int32_t base = h * head_dim;
+
+        cblas_sgemv(
+                CblasColMajor,
+                CblasTrans,
+                head_dim,
+                cache.length,
+                scale,
+                key_data + base,
+                hidden,
+                query_data + base,
+                1,
+                0.0f,
+                scores.data(),
+                1);
+
+        float max_score = -std::numeric_limits<float>::infinity();
+        for (int32_t pos = 0; pos < cache.length; ++pos) {
+            if (scores[size_t(pos)] > max_score) {
+                max_score = scores[size_t(pos)];
+            }
+        }
+
+        float denom = 0.0f;
+        for (int32_t pos = 0; pos < cache.length; ++pos) {
+            const float value = std::exp(scores[size_t(pos)] - max_score);
+            probs[size_t(pos)] = value;
+            denom += value;
+        }
+        denom = denom > 0.0f ? denom : 1.0f;
+
+        for (int32_t pos = 0; pos < cache.length; ++pos) {
+            probs[size_t(pos)] /= denom;
+        }
+
+        cblas_sgemv(
+                CblasColMajor,
+                CblasNoTrans,
+                head_dim,
+                cache.length,
+                1.0f,
+                value_data + base,
+                hidden,
+                probs.data(),
+                1,
+                0.0f,
+                out_data + base,
+                1);
+    }
+#else
     std::vector<float> scores(cache.length);
     std::vector<float> probs(cache.length);
 
@@ -1203,6 +2048,7 @@ static tensor2d decoder_self_attention_single(
             out.at(base + d, 0) = sum;
         }
     }
+#endif
 
     return out;
 }
@@ -1217,6 +2063,65 @@ static tensor2d decoder_cross_attention_single(
     const float scale = 1.0f / std::sqrt(float(head_dim));
 
     tensor2d out(hidden, 1);
+#if COHERE_HAVE_CBLAS
+    const float * query_data = query.data.data();
+    const float * key_data = cross.key.data.data();
+    const float * value_data = cross.value.data.data();
+    float * out_data = out.data.data();
+    std::vector<float> scores{std::vector<float>(size_t(length))};
+    std::vector<float> probs{std::vector<float>(size_t(length))};
+
+    for (int32_t h = 0; h < n_heads; ++h) {
+        const int32_t base = h * head_dim;
+
+        cblas_sgemv(
+                CblasColMajor,
+                CblasTrans,
+                head_dim,
+                length,
+                scale,
+                key_data + base,
+                hidden,
+                query_data + base,
+                1,
+                0.0f,
+                scores.data(),
+                1);
+
+        float max_score = -std::numeric_limits<float>::infinity();
+        for (int32_t pos = 0; pos < length; ++pos) {
+            if (scores[size_t(pos)] > max_score) {
+                max_score = scores[size_t(pos)];
+            }
+        }
+
+        float denom = 0.0f;
+        for (int32_t pos = 0; pos < length; ++pos) {
+            const float value = std::exp(scores[size_t(pos)] - max_score);
+            probs[size_t(pos)] = value;
+            denom += value;
+        }
+        denom = denom > 0.0f ? denom : 1.0f;
+
+        for (int32_t pos = 0; pos < length; ++pos) {
+            probs[size_t(pos)] /= denom;
+        }
+
+        cblas_sgemv(
+                CblasColMajor,
+                CblasNoTrans,
+                head_dim,
+                length,
+                1.0f,
+                value_data + base,
+                hidden,
+                probs.data(),
+                1,
+                0.0f,
+                out_data + base,
+                1);
+    }
+#else
     std::vector<float> scores(length);
     std::vector<float> probs(length);
 
@@ -1250,6 +2155,7 @@ static tensor2d decoder_cross_attention_single(
             out.at(base + d, 0) = sum;
         }
     }
+#endif
 
     return out;
 }
@@ -1257,20 +2163,36 @@ static tensor2d decoder_cross_attention_single(
 static std::vector<cross_kv_cache> build_cross_kv(
         model & model,
         const tensor2d & encoder_states,
-        int32_t n_threads) {
+        int32_t n_threads,
+        inference_runtime * runtime = nullptr) {
     std::vector<cross_kv_cache> caches(size_t(model.decoder.num_layers));
     for (int32_t il = 0; il < model.decoder.num_layers; ++il) {
         const std::string prefix = format("decoder.layers.%d.cross_attn.", il);
-        caches[size_t(il)].key = eval_linear(
-                require_tensor(model, prefix + "key.weight"),
+        ggml_ptr ctx_holder;
+        struct ggml_context * ctx = begin_linear_workspace(runtime);
+        if (ctx == nullptr) {
+            ctx_holder = make_compute_ctx();
+            ctx = ctx_holder.get();
+        }
+
+        struct ggml_tensor * key_weight = require_tensor(model, prefix + "key.weight");
+        struct ggml_tensor * value_weight = require_tensor(model, prefix + "value.weight");
+        struct ggml_tensor * src = create_matmul_input_tensor_2d(ctx, key_weight, encoder_states, runtime);
+        struct ggml_tensor * key_tensor = build_linear_graph(
+                ctx,
+                key_weight,
                 require_tensor(model, prefix + "key.bias", GGML_TYPE_F32),
-                encoder_states,
-                n_threads);
-        caches[size_t(il)].value = eval_linear(
-                require_tensor(model, prefix + "value.weight"),
+                src);
+        struct ggml_tensor * value_tensor = build_linear_graph(
+                ctx,
+                value_weight,
                 require_tensor(model, prefix + "value.bias", GGML_TYPE_F32),
-                encoder_states,
-                n_threads);
+                src);
+        run_graph_outputs(ctx, { key_tensor, value_tensor }, n_threads, runtime);
+
+        caches[size_t(il)].key = tensor_from_ggml_2d(key_tensor);
+        caches[size_t(il)].value = tensor_from_ggml_2d(value_tensor);
+        add_counter(counter_ptr(runtime, &overhead_counters::output_tensor_copies), 2);
     }
     return caches;
 }
@@ -1290,13 +2212,16 @@ static std::vector<float> decoder_step(
         int32_t position,
         const std::vector<cross_kv_cache> & cross_kv,
         std::vector<self_kv_cache> & self_kv,
-        int32_t n_threads) {
+        int32_t n_threads,
+        bool need_logits,
+        inference_runtime * runtime = nullptr) {
     tensor2d hidden = get_decoder_embedding(model, token_id, position);
 
     for (int32_t il = 0; il < model.decoder.num_layers; ++il) {
         const std::string prefix = format("decoder.layers.%d.", il);
 
         {
+            scope_timer timer(timer_ptr(runtime, &timing_breakdown_us::decoder_self_attention));
             tensor2d norm = layer_norm(
                     hidden,
                     require_tensor(model, prefix + "layer_norm_1.weight", GGML_TYPE_F32),
@@ -1306,28 +2231,33 @@ static std::vector<float> decoder_step(
                     require_tensor(model, prefix + "self_attn.query.weight"),
                     require_tensor(model, prefix + "self_attn.query.bias", GGML_TYPE_F32),
                     norm,
-                    n_threads);
+                    n_threads,
+                    runtime);
             tensor2d k = eval_linear(
                     require_tensor(model, prefix + "self_attn.key.weight"),
                     require_tensor(model, prefix + "self_attn.key.bias", GGML_TYPE_F32),
                     norm,
-                    n_threads);
+                    n_threads,
+                    runtime);
             tensor2d v = eval_linear(
                     require_tensor(model, prefix + "self_attn.value.weight"),
                     require_tensor(model, prefix + "self_attn.value.bias", GGML_TYPE_F32),
                     norm,
-                    n_threads);
+                    n_threads,
+                    runtime);
 
             tensor2d attn = decoder_self_attention_single(q, self_kv[size_t(il)], k, v, model.decoder.num_attention_heads);
             tensor2d proj = eval_linear(
                     require_tensor(model, prefix + "self_attn.out.weight"),
                     require_tensor(model, prefix + "self_attn.out.bias", GGML_TYPE_F32),
                     attn,
-                    n_threads);
+                    n_threads,
+                    runtime);
             hidden = add_scaled(hidden, proj, 1.0f);
         }
 
         {
+            scope_timer timer(timer_ptr(runtime, &timing_breakdown_us::decoder_cross_attention));
             tensor2d norm = layer_norm(
                     hidden,
                     require_tensor(model, prefix + "layer_norm_2.weight", GGML_TYPE_F32),
@@ -1337,17 +2267,20 @@ static std::vector<float> decoder_step(
                     require_tensor(model, prefix + "cross_attn.query.weight"),
                     require_tensor(model, prefix + "cross_attn.query.bias", GGML_TYPE_F32),
                     norm,
-                    n_threads);
+                    n_threads,
+                    runtime);
             tensor2d attn = decoder_cross_attention_single(q, cross_kv[size_t(il)], model.decoder.num_attention_heads);
             tensor2d proj = eval_linear(
                     require_tensor(model, prefix + "cross_attn.out.weight"),
                     require_tensor(model, prefix + "cross_attn.out.bias", GGML_TYPE_F32),
                     attn,
-                    n_threads);
+                    n_threads,
+                    runtime);
             hidden = add_scaled(hidden, proj, 1.0f);
         }
 
         {
+            scope_timer timer(timer_ptr(runtime, &timing_breakdown_us::decoder_ffn));
             tensor2d norm = layer_norm(
                     hidden,
                     require_tensor(model, prefix + "layer_norm_3.weight", GGML_TYPE_F32),
@@ -1359,9 +2292,14 @@ static std::vector<float> decoder_step(
                     require_tensor(model, prefix + "feed_forward.dense_out.weight"),
                     require_tensor(model, prefix + "feed_forward.dense_out.bias", GGML_TYPE_F32),
                     model.decoder.hidden_act,
-                    n_threads);
+                    n_threads,
+                    runtime);
             hidden = add_scaled(hidden, ff, 1.0f);
         }
+    }
+
+    if (!need_logits) {
+        return {};
     }
 
     hidden = layer_norm(
@@ -1374,11 +2312,16 @@ static std::vector<float> decoder_step(
         lm_head_weight = require_tensor(model, "decoder.embedding.token_embedding.weight");
     }
 
-    tensor2d logits = eval_linear(
-            lm_head_weight,
-            require_tensor(model, "lm_head.bias", GGML_TYPE_F32),
-            hidden,
-            n_threads);
+    tensor2d logits;
+    {
+        scope_timer timer(timer_ptr(runtime, &timing_breakdown_us::lm_head));
+        logits = eval_linear(
+                lm_head_weight,
+                require_tensor(model, "lm_head.bias", GGML_TYPE_F32),
+                hidden,
+                n_threads,
+                runtime);
+    }
 
     std::vector<float> out(size_t(logits.n0));
     for (int32_t i = 0; i < logits.n0; ++i) {
@@ -1963,6 +2906,7 @@ static bool run_inference(
         model & model,
         const std::vector<float> & pcmf32,
         const transcribe_params & params,
+        transcribe_profile * profile,
         debug_outputs * outputs,
         std::string & text,
         std::string & error) {
@@ -1970,6 +2914,9 @@ static bool run_inference(
     error.clear();
     if (outputs != nullptr) {
         *outputs = debug_outputs();
+    }
+    if (profile != nullptr) {
+        *profile = transcribe_profile();
     }
 
     try {
@@ -1990,13 +2937,23 @@ static bool run_inference(
         }
 
         const int32_t n_threads = std::max(1, params.n_threads);
-        encoder_trace trace = run_encoder_trace(model, pcmf32, n_threads);
+        configure_blas_threads_for_inference(n_threads);
+        inference_runtime runtime;
+        runtime.profile = profile;
+        encoder_trace trace = run_encoder_trace(model, pcmf32, n_threads, &runtime);
         tensor2d decoder_memory = trace.encoder_projected;
-        std::vector<cross_kv_cache> cross_kv = build_cross_kv(model, decoder_memory, n_threads);
+        std::vector<cross_kv_cache> cross_kv;
+        {
+            scope_timer timer(timer_ptr(&runtime, &timing_breakdown_us::cross_kv_build));
+            cross_kv = build_cross_kv(model, decoder_memory, n_threads, &runtime);
+        }
         std::vector<self_kv_cache> self_kv = build_self_kv(model);
 
         const std::vector<int32_t> prompt = model.vocab.build_prompt(params.language, params.punctuation);
         const int32_t eos_token_id = model.vocab.special_token_id("<|endoftext|>");
+        if (profile != nullptr) {
+            profile->prompt_token_count = (int32_t) prompt.size();
+        }
 
         if ((int32_t) prompt.size() > model.decoder.max_sequence_length) {
             throw std::runtime_error("decoder prompt exceeds decoder max sequence length");
@@ -2027,26 +2984,39 @@ static bool run_inference(
 
         int32_t current_position = 0;
         std::vector<float> logits;
-        for (size_t i = 0; i < prompt.size(); ++i) {
-            logits = decoder_step(model, prompt[i], current_position++, cross_kv, self_kv, n_threads);
-        }
-
-        if (outputs != nullptr) {
-            outputs->first_step_logits = logits;
-        }
-
-        const int32_t remaining = std::max(0, model.decoder.max_sequence_length - current_position);
-        const int32_t max_new_tokens = std::min(params.max_new_tokens, remaining);
-        for (int32_t i = 0; i < max_new_tokens; ++i) {
-            const int32_t next = argmax(logits);
-            if (next == eos_token_id) {
-                break;
+        {
+            scope_timer timer(timer_ptr(&runtime, &timing_breakdown_us::decoder_total));
+            for (size_t i = 0; i < prompt.size(); ++i) {
+                const bool need_logits = (i + 1 == prompt.size());
+                logits = decoder_step(model, prompt[i], current_position++, cross_kv, self_kv, n_threads, need_logits, &runtime);
+                if (profile != nullptr) {
+                    profile->decoder_step_count += 1;
+                }
             }
-            generated.push_back(next);
-            logits = decoder_step(model, next, current_position++, cross_kv, self_kv, n_threads);
+
+            if (outputs != nullptr) {
+                outputs->first_step_logits = logits;
+            }
+
+            const int32_t remaining = std::max(0, model.decoder.max_sequence_length - current_position);
+            const int32_t max_new_tokens = std::min(params.max_new_tokens, remaining);
+            for (int32_t i = 0; i < max_new_tokens; ++i) {
+                const int32_t next = argmax(logits);
+                if (next == eos_token_id) {
+                    break;
+                }
+                generated.push_back(next);
+                logits = decoder_step(model, next, current_position++, cross_kv, self_kv, n_threads, true, &runtime);
+                if (profile != nullptr) {
+                    profile->decoder_step_count += 1;
+                }
+            }
         }
 
         text = model.vocab.detokenize(generated);
+        if (profile != nullptr) {
+            profile->greedy_token_count = (int32_t) generated.size();
+        }
         if (outputs != nullptr) {
             outputs->greedy_ids = generated;
             outputs->text = text;
@@ -2067,7 +3037,17 @@ bool transcribe(
         const transcribe_params & params,
         std::string & text,
         std::string & error) {
-    return run_inference(model, pcmf32, params, nullptr, text, error);
+    return run_inference(model, pcmf32, params, nullptr, nullptr, text, error);
+}
+
+bool transcribe_with_profile(
+        model & model,
+        const std::vector<float> & pcmf32,
+        const transcribe_params & params,
+        transcribe_profile & profile,
+        std::string & text,
+        std::string & error) {
+    return run_inference(model, pcmf32, params, &profile, nullptr, text, error);
 }
 
 bool collect_debug_outputs(
@@ -2077,7 +3057,7 @@ bool collect_debug_outputs(
         debug_outputs & outputs,
         std::string & error) {
     std::string text;
-    return run_inference(model, pcmf32, params, &outputs, text, error);
+    return run_inference(model, pcmf32, params, nullptr, &outputs, text, error);
 }
 
 } // namespace cohere

@@ -128,6 +128,43 @@ struct debug_outputs {
     std::string text;
 };
 
+struct timing_breakdown_us {
+    int64_t frontend = 0;
+    int64_t subsampling = 0;
+    int64_t encoder_total = 0;
+    int64_t encoder_ffn = 0;
+    int64_t encoder_self_attention = 0;
+    int64_t encoder_conv = 0;
+    int64_t encoder_projection = 0;
+    int64_t cross_kv_build = 0;
+    int64_t decoder_total = 0;
+    int64_t decoder_self_attention = 0;
+    int64_t decoder_cross_attention = 0;
+    int64_t decoder_ffn = 0;
+    int64_t lm_head = 0;
+};
+
+struct overhead_counters {
+    int64_t eval_linear_calls = 0;
+    int64_t eval_linear_rank3_calls = 0;
+    int64_t ggml_context_creations = 0;
+    int64_t ggml_context_resets = 0;
+    int64_t ggml_graph_launches = 0;
+    int64_t input_tensor_copies = 0;
+    int64_t output_tensor_copies = 0;
+    int64_t rel_pos_cache_hits = 0;
+    int64_t rel_pos_cache_misses = 0;
+};
+
+struct transcribe_profile {
+    timing_breakdown_us timings_us;
+    overhead_counters counters;
+    int32_t prompt_token_count = 0;
+    int32_t greedy_token_count = 0;
+    int32_t decoder_step_count = 0;
+    int32_t encoder_frame_count = 0;
+};
+
 bool probe_model_architecture(const std::string & path_model, std::string & architecture, std::string * error = nullptr);
 
 bool load_model(const std::string & path_model, model & out, std::string & error);
@@ -137,6 +174,14 @@ bool transcribe(
         model & model,
         const std::vector<float> & pcmf32,
         const transcribe_params & params,
+        std::string & text,
+        std::string & error);
+
+bool transcribe_with_profile(
+        model & model,
+        const std::vector<float> & pcmf32,
+        const transcribe_params & params,
+        transcribe_profile & profile,
         std::string & text,
         std::string & error);
 
