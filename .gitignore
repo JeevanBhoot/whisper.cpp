@@ -64,6 +64,3 @@ cmake-build-debug/
 local.properties
 .log
 .exe
-
-tests/cohere-transcribe/local-fixtures/
-*__pycache__/
