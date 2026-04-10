@@ -51,9 +51,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("outfile", type=Path, help="Output GGUF path")
     parser.add_argument(
         "--dtype",
-        choices=("f16", "f32"),
+        choices=("f16", "bf16", "f32"),
         default="f16",
-        help="Tensor storage type for large weights (default: f16; use f32 for parity work)",
+        help="Tensor storage type for large weights (default: f16; use bf16 for native-like storage, f32 for parity work)",
     )
     return parser.parse_args()
 
@@ -309,19 +309,37 @@ def load_model_and_tokenizer(snapshot_dir: Path) -> tuple[Any, Any, Any, str]:
     return model, processor, tokenizer, "remote"
 
 
-def weight_dtype(name: str, export_dtype: str) -> np.dtype:
+def weight_qtype(name: str, export_dtype: str) -> gguf.GGMLQuantizationType:
     if export_dtype == "f32":
-        return np.float32
+        return gguf.GGMLQuantizationType.F32
     if name.endswith(".bias") or ".norm_" in name or ".layer_norm." in name or name.endswith(".weight") and "norm" in name:
-        return np.float32
+        return gguf.GGMLQuantizationType.F32
     if "pos_bias_" in name:
-        return np.float32
-    return np.float16
+        return gguf.GGMLQuantizationType.F32
+    if export_dtype == "bf16":
+        return gguf.GGMLQuantizationType.BF16
+    return gguf.GGMLQuantizationType.F16
 
 
 def add_tensor(writer: Any, name: str, array: np.ndarray, export_dtype: str) -> None:
-    dtype = weight_dtype(name, export_dtype)
-    writer.add_tensor(name, as_numpy(array, dtype))
+    qtype = weight_qtype(name, export_dtype)
+    if qtype == gguf.GGMLQuantizationType.F32:
+        writer.add_tensor(name, as_numpy(array, np.float32))
+        return
+
+    if qtype == gguf.GGMLQuantizationType.F16:
+        writer.add_tensor(name, as_numpy(array, np.float16))
+        return
+
+    if qtype == gguf.GGMLQuantizationType.BF16:
+        writer.add_tensor(
+            name,
+            gguf.quantize(as_numpy(array, np.float32), qtype),
+            raw_dtype=qtype,
+        )
+        return
+
+    raise SystemExit(f"unsupported export tensor type for '{name}': {qtype}")
 
 
 def linear_weight(module: Any) -> np.ndarray:
@@ -473,7 +491,12 @@ def export_model(snapshot_dir: Path, outfile: Path, export_dtype: str) -> None:
     if hasattr(writer, "add_name"):
         writer.add_name("Cohere Transcribe")
     if hasattr(writer, "add_file_type"):
-        qtype = gguf.GGMLQuantizationType.F16 if export_dtype == "f16" else gguf.GGMLQuantizationType.F32
+        if export_dtype == "f16":
+            qtype = gguf.GGMLQuantizationType.F16
+        elif export_dtype == "bf16":
+            qtype = gguf.GGMLQuantizationType.BF16
+        else:
+            qtype = gguf.GGMLQuantizationType.F32
         writer.add_file_type(qtype)
 
     add_metadata(writer, GGUF_PREFIX + "max_audio_clip_s", max_audio_clip_s)

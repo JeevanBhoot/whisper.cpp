@@ -392,6 +392,11 @@ static void copy_f32_from_tensor(const struct ggml_tensor * tensor, std::vector<
         return;
     }
 
+    if (tensor->type == GGML_TYPE_BF16 && ggml_is_contiguous(tensor)) {
+        ggml_bf16_to_fp32_row(reinterpret_cast<const ggml_bf16_t *>(tensor->data), out.data(), (int64_t) out.size());
+        return;
+    }
+
     if (ggml_n_dims(tensor) == 2) {
         const int32_t n0 = (int32_t) tensor->ne[0];
         const int32_t n1 = (int32_t) tensor->ne[1];
@@ -451,7 +456,7 @@ static enum ggml_type matmul_input_type_from_weight(const struct ggml_tensor * w
     }
 
     const enum ggml_type type = traits->vec_dot_type;
-    if (type == GGML_TYPE_F16 || type == GGML_TYPE_F32) {
+    if (type == GGML_TYPE_F16 || type == GGML_TYPE_BF16 || type == GGML_TYPE_F32) {
         return type;
     }
 
@@ -474,6 +479,11 @@ static struct ggml_tensor * create_input_tensor_2d(
         ggml_fp32_to_fp16_row(
                 input.data.data(),
                 reinterpret_cast<ggml_fp16_t *>(tensor->data),
+                (int64_t) input.data.size());
+    } else if (type == GGML_TYPE_BF16) {
+        ggml_fp32_to_bf16_row(
+                input.data.data(),
+                reinterpret_cast<ggml_bf16_t *>(tensor->data),
                 (int64_t) input.data.size());
     } else {
         throw std::runtime_error("unsupported ggml input tensor type");
@@ -521,7 +531,7 @@ static bool can_use_vec_dot_linear(const struct ggml_tensor * weight, const tens
         return false;
     }
 
-    if (weight->type != GGML_TYPE_F16 && weight->type != GGML_TYPE_F32) {
+    if (weight->type != GGML_TYPE_F16 && weight->type != GGML_TYPE_BF16 && weight->type != GGML_TYPE_F32) {
         return false;
     }
 
@@ -700,7 +710,7 @@ static tensor2d eval_linear_activation_linear(
     if (input.n1 == 1 &&
             can_use_vec_dot_linear(w1, input) &&
             ggml_is_contiguous(w2) &&
-            (w2->type == GGML_TYPE_F16 || w2->type == GGML_TYPE_F32) &&
+            (w2->type == GGML_TYPE_F16 || w2->type == GGML_TYPE_BF16 || w2->type == GGML_TYPE_F32) &&
             w2->ne[0] == w1->ne[1] &&
             w2->ne[1] <= 8192) {
         tensor2d hidden = eval_linear_vec_dot(w1, b1, input, runtime);
@@ -1034,6 +1044,9 @@ static tensor2d depthwise_conv1d(
     const ggml_fp16_t * weight_f16 = weight->type == GGML_TYPE_F16 && ggml_is_contiguous(weight)
             ? reinterpret_cast<const ggml_fp16_t *>(weight->data)
             : nullptr;
+    const ggml_bf16_t * weight_bf16 = weight->type == GGML_TYPE_BF16 && ggml_is_contiguous(weight)
+            ? reinterpret_cast<const ggml_bf16_t *>(weight->data)
+            : nullptr;
     std::vector<float> weight_cache;
 
     if (weight_f32 == nullptr && weight_f16 != nullptr) {
@@ -1041,6 +1054,11 @@ static tensor2d depthwise_conv1d(
         ggml_fp16_to_fp32_row(weight_f16, weight_cache.data(), (int64_t) weight_cache.size());
         weight_f32 = weight_cache.data();
         weight_f16 = nullptr;
+    } else if (weight_f32 == nullptr && weight_bf16 != nullptr) {
+        weight_cache.resize(size_t(kernel) * size_t(channels));
+        ggml_bf16_to_fp32_row(weight_bf16, weight_cache.data(), (int64_t) weight_cache.size());
+        weight_f32 = weight_cache.data();
+        weight_bf16 = nullptr;
     }
 
     tensor2d out(x.n0, x.n1);
@@ -1055,7 +1073,8 @@ static tensor2d depthwise_conv1d(
                 }
                 const size_t index = size_t(k) + size_t(kernel) * size_t(c);
                 const float w = weight_f32 ? weight_f32[index]
-                        : (weight_f16 ? ggml_fp16_to_fp32(weight_f16[index]) : tensor_get_f32(weight, k, 0, c));
+                        : (weight_f16 ? ggml_fp16_to_fp32(weight_f16[index])
+                        : (weight_bf16 ? ggml_bf16_to_fp32(weight_bf16[index]) : tensor_get_f32(weight, k, 0, c)));
                 sum += w * x.at(c, src_t);
             }
             out.at(c, t) = sum;
@@ -1742,6 +1761,10 @@ static tensor2d get_decoder_embedding(const model & model, int32_t token_id, int
         const ggml_fp16_t * token_col = reinterpret_cast<const ggml_fp16_t *>(
                 reinterpret_cast<const char *>(token_embedding->data) + size_t(token_id) * size_t(token_embedding->nb[1]));
         ggml_fp16_to_fp32_row(token_col, out_data, hidden);
+    } else if (token_embedding->type == GGML_TYPE_BF16 && ggml_is_contiguous(token_embedding)) {
+        const ggml_bf16_t * token_col = reinterpret_cast<const ggml_bf16_t *>(
+                reinterpret_cast<const char *>(token_embedding->data) + size_t(token_id) * size_t(token_embedding->nb[1]));
+        ggml_bf16_to_fp32_row(token_col, out_data, hidden);
     } else {
         for (int32_t i = 0; i < hidden; ++i) {
             out_data[i] = tensor_get_f32(token_embedding, i, token_id);
