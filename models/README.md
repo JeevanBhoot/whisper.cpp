@@ -70,21 +70,35 @@ run various sanitizer tests.
 
 ## Cohere Transcribe GGUF models
 
+Create a Python virtual environment and install the necessary dependencies:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install torch transformers soundfile safetensors sentencepiece gguf huggingface_hub librosa
+```
+
+Log in to Hugging Face and download the Cohere Transcribe snapshot locally:
+
+```bash
+hf auth login 
+hf download CohereLabs/cohere-transcribe-03-2026 --local-dir ./artifacts/hf/cohere-transcribe
+```
+
 Support for Cohere Transcribe is provided through a separate GGUF conversion script:
 
 ```bash
-python3 ./models/convert-cohere-transcribe-to-gguf.py /path/to/cohere-transcribe-snapshot ./models/cohere-transcribe.gguf
+python3 ./models/convert-cohere-transcribe-to-gguf.py ./artifacts/hf/cohere-transcribe ./artifacts/gguf/cohere-transcribe
 ```
-
-The snapshot must be available locally. This repo does not provide download scripts or hosted Cohere model weights.
 
 Once converted, `whisper-cli` will detect the Cohere architecture automatically:
 
 ```bash
-./build/bin/whisper-cli -m ./models/cohere-transcribe.gguf -l en -f samples/jfk.wav
+./build/bin/whisper-cli -m ./artifacts/gguf/cohere-transcribe -f samples/jfk.wav
 ```
 
-Current Cohere CLI support is limited to text-only transcription with an explicit language code.
+- Language tag: use `-l` / `--language`; the default is `en` (English).
+- GGUF size: `f16` is about 3.8 GB and `f32` is about 7.7 GB.
 
 ## Fine-tuned models
 
