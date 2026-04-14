@@ -97,10 +97,26 @@ static void test_detokenizer() {
     assert(invalid == u8"\uFFFD");
 }
 
+static void test_context_default_params() {
+    const cohere::context_params params = cohere::context_default_params();
+    assert(params.use_gpu);
+    assert(params.flash_attn);
+    assert(params.gpu_device == 0);
+}
+
+static void test_state_free_is_idempotent() {
+    cohere::state state;
+    cohere::free_state(state);
+    cohere::free_state(state);
+    assert(state.impl == nullptr);
+}
+
 int main() {
     test_prompt_building();
     test_rel_shift_reference();
     test_subsampling_length();
     test_detokenizer();
+    test_context_default_params();
+    test_state_free_is_idempotent();
     return 0;
 }

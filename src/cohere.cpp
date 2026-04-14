@@ -1,5 +1,6 @@
 #include "cohere.h"
 
+#include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "gguf.h"
 
@@ -9,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <sstream>
@@ -38,6 +40,7 @@ static const char * GGUF_ARCH_VALUE = "cohere-transcribe";
 static const char * GGUF_PREFIX = "cohere_transcribe.";
 static const float  LAYER_NORM_EPS = 1e-5f;
 static const size_t SCRATCH_SIZE = 512ull * 1024ull * 1024ull;
+static const size_t COHERE_MAX_NODES = 16384;
 
 struct gguf_context_deleter {
     void operator()(struct gguf_context * ctx) const {
@@ -122,11 +125,90 @@ struct linear_workspace {
     ggml_ptr ctx;
 };
 
+struct backend_model_data;
+struct backend_state_data;
+
 struct inference_runtime {
     linear_workspace linear_ws;
     std::map<int64_t, tensor2d> rel_pos_cache;
     std::vector<uint8_t> vec_dot_input_buffer;
+    std::vector<ggml_backend_buffer_t> temp_input_buffers;
+    const backend_model_data * backend_model = nullptr;
+    backend_state_data * backend_state = nullptr;
 };
+
+struct cohere_sched {
+    ggml_backend_sched_t sched = nullptr;
+    std::vector<uint8_t> meta;
+};
+
+struct backend_kv_cache {
+    std::vector<uint8_t> ctx_buf;
+    ggml_backend_buffer_t buffer = nullptr;
+    struct ggml_tensor * k = nullptr;
+    struct ggml_tensor * v = nullptr;
+    int32_t size = 0;
+    int32_t n = 0;
+};
+
+struct backend_model_data {
+    context_params params;
+    std::string path_model;
+    bool use_gpu_active = false;
+    std::string backend_name;
+    ggml_backend_dev_t device = nullptr;
+    int32_t max_valid_mel_frames = 0;
+    int32_t max_mel_frames = 0;
+    int32_t max_encoder_valid_length = 0;
+    int32_t max_encoder_length = 0;
+    int32_t cross_hidden_size = 0;
+    std::vector<struct ggml_context *> ctxs;
+    std::map<std::string, struct ggml_tensor *> tensors;
+    std::vector<ggml_backend_buffer_t> buffers;
+};
+
+struct backend_state_data {
+    context_params params;
+    bool legacy_cpu = false;
+    std::string backend_name;
+
+    std::vector<ggml_backend_t> backends;
+    cohere_sched sched_conv;
+    cohere_sched sched_encode;
+    cohere_sched sched_cross;
+    cohere_sched sched_decode;
+
+    backend_kv_cache kv_self;
+    backend_kv_cache kv_cross;
+
+    std::vector<uint8_t> tensor_ctx_buf;
+    ggml_backend_buffer_t tensor_buffer = nullptr;
+    struct ggml_tensor * conv_out = nullptr;
+    struct ggml_tensor * encoder_out = nullptr;
+    struct ggml_tensor * encoder_rel_pos = nullptr;
+    struct ggml_tensor * decoder_pos = nullptr;
+
+    int32_t encoder_valid_length = 0;
+    int32_t encoder_length = 0;
+    int32_t self_kv_length = 0;
+
+    std::vector<float> mel_input;
+    std::vector<float> conv_mask0;
+    std::vector<float> conv_mask1;
+    std::vector<float> conv_mask2;
+    std::vector<float> encoder_mask;
+    std::vector<float> decode_mask;
+    std::vector<int32_t> rel_shift_indices;
+    std::vector<float> logits;
+};
+
+static bool runtime_uses_backend(const inference_runtime * runtime);
+static struct ggml_tensor * maybe_backend_tensor(inference_runtime * runtime, const struct ggml_tensor * tensor);
+static bool ggml_graph_compute_helper(
+        ggml_backend_sched_t sched,
+        struct ggml_cgraph * graph,
+        int32_t n_threads,
+        bool sched_reset = true);
 
 struct fft_trig_cache {
     int32_t n = 0;
@@ -147,11 +229,11 @@ static std::string gguf_key(const std::string & suffix) {
     return std::string(GGUF_PREFIX) + suffix;
 }
 
-static ggml_ptr make_compute_ctx(size_t mem_size = SCRATCH_SIZE) {
+static ggml_ptr make_compute_ctx(size_t mem_size = SCRATCH_SIZE, bool no_alloc = false) {
     struct ggml_init_params params = {
         /*.mem_size   =*/ mem_size,
         /*.mem_buffer =*/ nullptr,
-        /*.no_alloc   =*/ false,
+        /*.no_alloc   =*/ no_alloc,
     };
 
     struct ggml_context * ctx = ggml_init(params);
@@ -225,8 +307,7 @@ static const fft_trig_cache & get_fft_trig_cache(int32_t n) {
 
 static linear_workspace make_linear_workspace(inference_runtime * runtime) {
     linear_workspace ws;
-    ws.ctx = make_compute_ctx();
-    GGML_UNUSED(runtime);
+    ws.ctx = make_compute_ctx(SCRATCH_SIZE, runtime_uses_backend(runtime));
     return ws;
 }
 
@@ -242,13 +323,69 @@ static struct ggml_context * begin_linear_workspace(inference_runtime * runtime)
     return runtime->linear_ws.ctx.get();
 }
 
+static cohere_sched * get_runtime_sched(inference_runtime * runtime) {
+    if (!runtime_uses_backend(runtime)) {
+        return nullptr;
+    }
+
+    return &runtime->backend_state->sched_encode;
+}
+
+static void ensure_runtime_sched(inference_runtime * runtime, cohere_sched & sched) {
+    if (sched.sched != nullptr) {
+        return;
+    }
+
+    sched.sched = ggml_backend_sched_new(
+            runtime->backend_state->backends.data(),
+            nullptr,
+            runtime->backend_state->backends.size(),
+            COHERE_MAX_NODES,
+            false,
+            true);
+    if (sched.sched == nullptr) {
+        throw std::runtime_error("failed to create Cohere backend scheduler");
+    }
+
+    sched.meta.resize(ggml_tensor_overhead() * COHERE_MAX_NODES + ggml_graph_overhead());
+}
+
 static void run_graph(struct ggml_context * ctx, struct ggml_tensor * output, int32_t n_threads, inference_runtime * runtime = nullptr) {
     struct ggml_cgraph * gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, output);
 
-    GGML_UNUSED(runtime);
-    if (ggml_graph_compute_with_ctx(ctx, gf, n_threads) != GGML_STATUS_SUCCESS) {
-        throw std::runtime_error("ggml graph execution failed");
+    auto cleanup_inputs = [&](void) {
+        if (runtime == nullptr) {
+            return;
+        }
+        for (ggml_backend_buffer_t buffer : runtime->temp_input_buffers) {
+            if (buffer != nullptr) {
+                ggml_backend_buffer_free(buffer);
+            }
+        }
+        runtime->temp_input_buffers.clear();
+    };
+
+    cohere_sched * sched = get_runtime_sched(runtime);
+    if (sched == nullptr) {
+        const bool ok = ggml_graph_compute_with_ctx(ctx, gf, n_threads) == GGML_STATUS_SUCCESS;
+        cleanup_inputs();
+        if (!ok) {
+            throw std::runtime_error("ggml graph execution failed");
+        }
+        return;
+    }
+
+    ensure_runtime_sched(runtime, *sched);
+    ggml_backend_sched_reset(sched->sched);
+    if (!ggml_backend_sched_alloc_graph(sched->sched, gf)) {
+        cleanup_inputs();
+        throw std::runtime_error("failed to allocate Cohere backend graph");
+    }
+    const bool ok = ggml_graph_compute_helper(sched->sched, gf, n_threads, false);
+    cleanup_inputs();
+    if (!ok) {
+        throw std::runtime_error("ggml backend graph execution failed");
     }
 }
 
@@ -262,10 +399,100 @@ static void run_graph_outputs(
         ggml_build_forward_expand(gf, output);
     }
 
-    GGML_UNUSED(runtime);
-    if (ggml_graph_compute_with_ctx(ctx, gf, n_threads) != GGML_STATUS_SUCCESS) {
-        throw std::runtime_error("ggml graph execution failed");
+    auto cleanup_inputs = [&](void) {
+        if (runtime == nullptr) {
+            return;
+        }
+        for (ggml_backend_buffer_t buffer : runtime->temp_input_buffers) {
+            if (buffer != nullptr) {
+                ggml_backend_buffer_free(buffer);
+            }
+        }
+        runtime->temp_input_buffers.clear();
+    };
+
+    cohere_sched * sched = get_runtime_sched(runtime);
+    if (sched == nullptr) {
+        const bool ok = ggml_graph_compute_with_ctx(ctx, gf, n_threads) == GGML_STATUS_SUCCESS;
+        cleanup_inputs();
+        if (!ok) {
+            throw std::runtime_error("ggml graph execution failed");
+        }
+        return;
     }
+
+    ensure_runtime_sched(runtime, *sched);
+    ggml_backend_sched_reset(sched->sched);
+    if (!ggml_backend_sched_alloc_graph(sched->sched, gf)) {
+        cleanup_inputs();
+        throw std::runtime_error("failed to allocate Cohere backend graph");
+    }
+    const bool ok = ggml_graph_compute_helper(sched->sched, gf, n_threads, false);
+    cleanup_inputs();
+    if (!ok) {
+        throw std::runtime_error("ggml backend graph execution failed");
+    }
+}
+
+static bool ggml_graph_compute_helper(
+        ggml_backend_sched_t sched,
+        struct ggml_cgraph * graph,
+        int32_t n_threads,
+        bool sched_reset) {
+    for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+        ggml_backend_t backend = ggml_backend_sched_get_backend(sched, i);
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+
+        ggml_backend_set_n_threads_t fn_set_n_threads = reg
+                ? (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads")
+                : nullptr;
+        if (fn_set_n_threads != nullptr) {
+            fn_set_n_threads(backend, n_threads);
+        }
+    }
+
+    const bool ok = ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS;
+    if (!ok || sched_reset) {
+        ggml_backend_sched_reset(sched);
+    }
+
+    return ok;
+}
+
+static size_t cohere_sched_size(const cohere_sched & sched) {
+    size_t size = sched.meta.size();
+    if (sched.sched == nullptr) {
+        return size;
+    }
+
+    for (int i = 0; i < ggml_backend_sched_get_n_backends(sched.sched); ++i) {
+        ggml_backend_t backend = ggml_backend_sched_get_backend(sched.sched, i);
+        size += ggml_backend_sched_get_buffer_size(sched.sched, backend);
+    }
+
+    return size;
+}
+
+static bool cohere_sched_graph_init(
+        cohere_sched & allocr,
+        const std::vector<ggml_backend_t> & backends,
+        std::function<struct ggml_cgraph *()> && get_graph) {
+    allocr.sched = ggml_backend_sched_new(
+            const_cast<ggml_backend_t *>(backends.data()),
+            nullptr,
+            int(backends.size()),
+            COHERE_MAX_NODES,
+            false,
+            true);
+    allocr.meta.resize(ggml_tensor_overhead() * COHERE_MAX_NODES + ggml_graph_overhead());
+
+    if (!ggml_backend_sched_alloc_graph(allocr.sched, get_graph())) {
+        return false;
+    }
+
+    ggml_backend_sched_reset(allocr.sched);
+    return true;
 }
 
 static int32_t gguf_get_key_id_or_throw(const struct gguf_context * gguf, const std::string & key) {
@@ -382,14 +609,30 @@ static const float * tensor_data_f32(const struct ggml_tensor * tensor) {
 static float tensor_get_f32(const struct ggml_tensor * tensor, int32_t i0, int32_t i1 = 0, int32_t i2 = 0, int32_t i3 = 0);
 
 static void copy_f32_from_tensor(const struct ggml_tensor * tensor, std::vector<float> & out) {
+    const bool has_backend_buffer = tensor->buffer != nullptr && !ggml_backend_buffer_is_host(tensor->buffer);
+    std::vector<uint8_t> raw;
+
+    if (has_backend_buffer) {
+        raw.resize(ggml_nbytes(tensor));
+        ggml_backend_tensor_get(tensor, raw.data(), 0, raw.size());
+    }
+
     if (tensor->type == GGML_TYPE_F32 && ggml_is_contiguous(tensor)) {
-        std::memcpy(out.data(), tensor->data, out.size() * sizeof(float));
+        const void * data = has_backend_buffer ? raw.data() : tensor->data;
+        std::memcpy(out.data(), data, out.size() * sizeof(float));
         return;
     }
 
     if (tensor->type == GGML_TYPE_F16 && ggml_is_contiguous(tensor)) {
-        ggml_fp16_to_fp32_row(reinterpret_cast<const ggml_fp16_t *>(tensor->data), out.data(), (int64_t) out.size());
+        const ggml_fp16_t * data = has_backend_buffer
+                ? reinterpret_cast<const ggml_fp16_t *>(raw.data())
+                : reinterpret_cast<const ggml_fp16_t *>(tensor->data);
+        ggml_fp16_to_fp32_row(data, out.data(), (int64_t) out.size());
         return;
+    }
+
+    if (has_backend_buffer) {
+        throw std::runtime_error("unsupported non-contiguous backend tensor copy");
     }
 
     if (ggml_n_dims(tensor) == 2) {
@@ -468,6 +711,22 @@ static struct ggml_tensor * create_input_tensor_2d(
         throw std::runtime_error("failed to allocate ggml input tensor");
     }
 
+    if (runtime_uses_backend(runtime)) {
+        ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), ggml_nbytes(tensor));
+        if (buffer == nullptr) {
+            throw std::runtime_error("failed to allocate host buffer for Cohere input tensor");
+        }
+
+        tensor->data = ggml_backend_buffer_get_base(buffer);
+        tensor->buffer = buffer;
+        if (ggml_backend_buffer_init_tensor(buffer, tensor) != GGML_STATUS_SUCCESS) {
+            ggml_backend_buffer_free(buffer);
+            tensor->buffer = nullptr;
+            throw std::runtime_error("failed to initialize Cohere input tensor backend buffer");
+        }
+        runtime->temp_input_buffers.push_back(buffer);
+    }
+
     if (type == GGML_TYPE_F32) {
         std::memcpy(tensor->data, input.data.data(), input.data.size() * sizeof(float));
     } else if (type == GGML_TYPE_F16) {
@@ -479,6 +738,7 @@ static struct ggml_tensor * create_input_tensor_2d(
         throw std::runtime_error("unsupported ggml input tensor type");
     }
 
+    ggml_set_input(tensor);
     GGML_UNUSED(runtime);
     return tensor;
 }
@@ -496,7 +756,23 @@ static struct ggml_tensor * create_input_tensor_4d(struct ggml_context * ctx, co
     if (tensor == nullptr) {
         throw std::runtime_error("failed to allocate ggml input tensor");
     }
+    if (runtime_uses_backend(runtime)) {
+        ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), ggml_nbytes(tensor));
+        if (buffer == nullptr) {
+            throw std::runtime_error("failed to allocate host buffer for Cohere input tensor");
+        }
+
+        tensor->data = ggml_backend_buffer_get_base(buffer);
+        tensor->buffer = buffer;
+        if (ggml_backend_buffer_init_tensor(buffer, tensor) != GGML_STATUS_SUCCESS) {
+            ggml_backend_buffer_free(buffer);
+            tensor->buffer = nullptr;
+            throw std::runtime_error("failed to initialize Cohere input tensor backend buffer");
+        }
+        runtime->temp_input_buffers.push_back(buffer);
+    }
     std::memcpy(tensor->data, input.data.data(), input.data.size() * sizeof(float));
+    ggml_set_input(tensor);
     GGML_UNUSED(runtime);
     return tensor;
 }
@@ -580,7 +856,10 @@ static tensor2d eval_linear(
         const tensor2d & input,
         int32_t n_threads,
         inference_runtime * runtime = nullptr) {
-    if (can_use_vec_dot_linear(weight, input)) {
+    struct ggml_tensor * weight_eval = maybe_backend_tensor(runtime, weight);
+    const struct ggml_tensor * bias_eval = maybe_backend_tensor(runtime, bias);
+
+    if (weight_eval == weight && bias_eval == bias && can_use_vec_dot_linear(weight, input)) {
         return eval_linear_vec_dot(weight, bias, input, runtime);
     }
 
@@ -591,10 +870,10 @@ static tensor2d eval_linear(
         ctx = ctx_holder.get();
     }
 
-    struct ggml_tensor * src = create_matmul_input_tensor_2d(ctx, weight, input, runtime);
-    struct ggml_tensor * cur = ggml_mul_mat(ctx, weight, src);
-    if (bias != nullptr) {
-        struct ggml_tensor * bias2 = ggml_reshape_2d(ctx, const_cast<struct ggml_tensor *>(bias), bias->ne[0], 1);
+    struct ggml_tensor * src = create_matmul_input_tensor_2d(ctx, weight_eval, input, runtime);
+    struct ggml_tensor * cur = ggml_mul_mat(ctx, weight_eval, src);
+    if (bias_eval != nullptr) {
+        struct ggml_tensor * bias2 = ggml_reshape_2d(ctx, const_cast<struct ggml_tensor *>(bias_eval), bias_eval->ne[0], 1);
         cur = ggml_add(ctx, cur, ggml_repeat(ctx, bias2, cur));
     }
     run_graph(ctx, cur, n_threads, runtime);
@@ -610,6 +889,9 @@ static tensor2d eval_linear_from_rank3_weight(
         const tensor2d & input,
         int32_t n_threads,
         inference_runtime * runtime = nullptr) {
+    struct ggml_tensor * weight_eval = maybe_backend_tensor(runtime, weight);
+    const struct ggml_tensor * bias_eval = maybe_backend_tensor(runtime, bias);
+
     ggml_ptr ctx_holder;
     struct ggml_context * ctx = begin_linear_workspace(runtime);
     if (ctx == nullptr) {
@@ -617,11 +899,11 @@ static tensor2d eval_linear_from_rank3_weight(
         ctx = ctx_holder.get();
     }
 
-    struct ggml_tensor * src = create_matmul_input_tensor_2d(ctx, weight, input, runtime);
-    struct ggml_tensor * w2 = ggml_reshape_2d(ctx, weight, weight->ne[0] * weight->ne[1], weight->ne[2]);
+    struct ggml_tensor * src = create_matmul_input_tensor_2d(ctx, weight_eval, input, runtime);
+    struct ggml_tensor * w2 = ggml_reshape_2d(ctx, weight_eval, weight_eval->ne[0] * weight_eval->ne[1], weight_eval->ne[2]);
     struct ggml_tensor * cur = ggml_mul_mat(ctx, w2, src);
-    if (bias != nullptr) {
-        struct ggml_tensor * bias2 = ggml_reshape_2d(ctx, const_cast<struct ggml_tensor *>(bias), bias->ne[0], 1);
+    if (bias_eval != nullptr) {
+        struct ggml_tensor * bias2 = ggml_reshape_2d(ctx, const_cast<struct ggml_tensor *>(bias_eval), bias_eval->ne[0], 1);
         cur = ggml_add(ctx, cur, ggml_repeat(ctx, bias2, cur));
     }
     run_graph(ctx, cur, n_threads, runtime);
@@ -637,6 +919,9 @@ static tensor2d eval_linear_from_rank4_weight(
         const tensor2d & input,
         int32_t n_threads,
         inference_runtime * runtime = nullptr) {
+    struct ggml_tensor * weight_eval = maybe_backend_tensor(runtime, weight);
+    const struct ggml_tensor * bias_eval = maybe_backend_tensor(runtime, bias);
+
     ggml_ptr ctx_holder;
     struct ggml_context * ctx = begin_linear_workspace(runtime);
     if (ctx == nullptr) {
@@ -644,11 +929,15 @@ static tensor2d eval_linear_from_rank4_weight(
         ctx = ctx_holder.get();
     }
 
-    struct ggml_tensor * src = create_matmul_input_tensor_2d(ctx, weight, input, runtime);
-    struct ggml_tensor * w2 = ggml_reshape_2d(ctx, weight, weight->ne[0] * weight->ne[1] * weight->ne[2], weight->ne[3]);
+    struct ggml_tensor * src = create_matmul_input_tensor_2d(ctx, weight_eval, input, runtime);
+    struct ggml_tensor * w2 = ggml_reshape_2d(
+            ctx,
+            weight_eval,
+            weight_eval->ne[0] * weight_eval->ne[1] * weight_eval->ne[2],
+            weight_eval->ne[3]);
     struct ggml_tensor * cur = ggml_mul_mat(ctx, w2, src);
-    if (bias != nullptr) {
-        struct ggml_tensor * bias2 = ggml_reshape_2d(ctx, const_cast<struct ggml_tensor *>(bias), bias->ne[0], 1);
+    if (bias_eval != nullptr) {
+        struct ggml_tensor * bias2 = ggml_reshape_2d(ctx, const_cast<struct ggml_tensor *>(bias_eval), bias_eval->ne[0], 1);
         cur = ggml_add(ctx, cur, ggml_repeat(ctx, bias2, cur));
     }
     run_graph(ctx, cur, n_threads, runtime);
@@ -697,6 +986,12 @@ static tensor2d eval_linear_activation_linear(
         const std::string & act,
         int32_t n_threads,
         inference_runtime * runtime = nullptr) {
+    if (maybe_backend_tensor(runtime, w1) != w1 || maybe_backend_tensor(runtime, w2) != w2) {
+        tensor2d hidden = eval_linear(w1, b1, input, n_threads, runtime);
+        apply_activation(hidden, act);
+        return eval_linear(w2, b2, hidden, n_threads, runtime);
+    }
+
     if (input.n1 == 1 &&
             can_use_vec_dot_linear(w1, input) &&
             ggml_is_contiguous(w2) &&
@@ -745,8 +1040,29 @@ static tensor4d eval_conv2d(
         int32_t stride_y,
         int32_t pad_x,
         int32_t pad_y,
-        int32_t n_threads) {
-    (void) n_threads;
+        int32_t n_threads,
+        inference_runtime * runtime = nullptr) {
+    struct ggml_tensor * weight_eval = maybe_backend_tensor(runtime, weight);
+    const struct ggml_tensor * bias_eval = maybe_backend_tensor(runtime, bias);
+    const bool use_backend_conv = false;
+
+    if (use_backend_conv && (weight_eval != weight || bias_eval != bias)) {
+        ggml_ptr ctx_holder;
+        struct ggml_context * ctx = begin_linear_workspace(runtime);
+        if (ctx == nullptr) {
+            ctx_holder = make_compute_ctx();
+            ctx = ctx_holder.get();
+        }
+
+        struct ggml_tensor * src = create_input_tensor_4d(ctx, input, runtime);
+        struct ggml_tensor * cur = ggml_conv_2d(ctx, weight_eval, src, stride_x, stride_y, pad_x, pad_y, 1, 1);
+        if (bias_eval != nullptr) {
+            struct ggml_tensor * bias4 = ggml_reshape_4d(ctx, const_cast<struct ggml_tensor *>(bias_eval), 1, 1, bias_eval->ne[0], 1);
+            cur = ggml_add(ctx, cur, ggml_repeat(ctx, bias4, cur));
+        }
+        run_graph(ctx, cur, n_threads, runtime);
+        return tensor_from_ggml_4d(cur);
+    }
 
     const tensor4d kernel = tensor_from_ggml_4d(weight);
     if (kernel.n2 != input.n2) {
@@ -846,8 +1162,29 @@ static tensor4d eval_conv2d_dw(
         int32_t stride_y,
         int32_t pad_x,
         int32_t pad_y,
-        int32_t n_threads) {
-    (void) n_threads;
+        int32_t n_threads,
+        inference_runtime * runtime = nullptr) {
+    struct ggml_tensor * weight_eval = maybe_backend_tensor(runtime, weight);
+    const struct ggml_tensor * bias_eval = maybe_backend_tensor(runtime, bias);
+    const bool use_backend_conv = false;
+
+    if (use_backend_conv && (weight_eval != weight || bias_eval != bias)) {
+        ggml_ptr ctx_holder;
+        struct ggml_context * ctx = begin_linear_workspace(runtime);
+        if (ctx == nullptr) {
+            ctx_holder = make_compute_ctx();
+            ctx = ctx_holder.get();
+        }
+
+        struct ggml_tensor * src = create_input_tensor_4d(ctx, input, runtime);
+        struct ggml_tensor * cur = ggml_conv_2d_dw(ctx, weight_eval, src, stride_x, stride_y, pad_x, pad_y, 1, 1);
+        if (bias_eval != nullptr) {
+            struct ggml_tensor * bias4 = ggml_reshape_4d(ctx, const_cast<struct ggml_tensor *>(bias_eval), 1, 1, bias_eval->ne[0], 1);
+            cur = ggml_add(ctx, cur, ggml_repeat(ctx, bias4, cur));
+        }
+        run_graph(ctx, cur, n_threads, runtime);
+        return tensor_from_ggml_4d(cur);
+    }
 
     const tensor4d kernel = tensor_from_ggml_4d(weight);
     if (kernel.n2 != 1) {
@@ -1023,7 +1360,53 @@ static tensor2d glu(const tensor2d & x) {
 static tensor2d depthwise_conv1d(
         const tensor2d & x,
         const struct ggml_tensor * weight,
-        const struct ggml_tensor * bias) {
+        const struct ggml_tensor * bias,
+        int32_t n_threads,
+        inference_runtime * runtime = nullptr) {
+    const struct ggml_tensor * weight_eval = maybe_backend_tensor(runtime, weight);
+    const struct ggml_tensor * bias_eval = maybe_backend_tensor(runtime, bias);
+    const bool use_backend_conv = false;
+
+    if (use_backend_conv && (weight_eval != weight || bias_eval != bias)) {
+        ggml_ptr ctx_holder;
+        struct ggml_context * ctx = begin_linear_workspace(runtime);
+        if (ctx == nullptr) {
+            ctx_holder = make_compute_ctx();
+            ctx = ctx_holder.get();
+        }
+
+        tensor2d transposed(x.n1, x.n0);
+        for (int32_t t = 0; t < x.n1; ++t) {
+            for (int32_t c = 0; c < x.n0; ++c) {
+                transposed.at(t, c) = x.at(c, t);
+            }
+        }
+
+        struct ggml_tensor * src = create_input_tensor_2d(ctx, transposed, GGML_TYPE_F32, runtime);
+        struct ggml_tensor * cur = ggml_conv_1d_dw_ph(
+                ctx,
+                const_cast<struct ggml_tensor *>(weight_eval),
+                src,
+                1,
+                1);
+        if (bias_eval != nullptr) {
+            struct ggml_tensor * bias3 = ggml_reshape_3d(ctx, const_cast<struct ggml_tensor *>(bias_eval), 1, bias_eval->ne[0], 1);
+            cur = ggml_add(ctx, cur, ggml_repeat(ctx, bias3, cur));
+        }
+        cur = ggml_reshape_2d(ctx, cur, cur->ne[0], cur->ne[1] * cur->ne[2]);
+        run_graph(ctx, cur, n_threads, runtime);
+
+        tensor2d out_tc = tensor_from_ggml_2d(cur);
+        tensor2d out(x.n0, x.n1);
+        for (int32_t t = 0; t < x.n1; ++t) {
+            for (int32_t c = 0; c < x.n0; ++c) {
+                out.at(c, t) = out_tc.at(t, c);
+            }
+        }
+
+        return out;
+    }
+
     const int32_t kernel = (int32_t) weight->ne[0];
     const int32_t channels = x.n0;
     const int32_t pad = kernel / 2;
@@ -1141,27 +1524,11 @@ static tensor2d encoder_self_attention(
     const int32_t head_dim = hidden / n_heads;
     const float scale = 1.0f / std::sqrt(float(head_dim));
 
-    ggml_ptr ctx_holder;
-    struct ggml_context * ctx = begin_linear_workspace(runtime);
-    if (ctx == nullptr) {
-        ctx_holder = make_compute_ctx();
-        ctx = ctx_holder.get();
-    }
-
     const tensor2d & rel_pos = get_relative_positional_encoding(runtime, hidden, length);
-    struct ggml_tensor * src = create_matmul_input_tensor_2d(ctx, q_weight, x, runtime);
-    struct ggml_tensor * pos_src = create_matmul_input_tensor_2d(ctx, pos_weight, rel_pos, runtime);
-
-    struct ggml_tensor * q_tensor = build_linear_graph(ctx, q_weight, q_bias, src);
-    struct ggml_tensor * k_tensor = build_linear_graph(ctx, k_weight, k_bias, src);
-    struct ggml_tensor * v_tensor = build_linear_graph(ctx, v_weight, v_bias, src);
-    struct ggml_tensor * p_tensor = build_linear_graph(ctx, pos_weight, nullptr, pos_src);
-    run_graph_outputs(ctx, { q_tensor, k_tensor, v_tensor, p_tensor }, n_threads, runtime);
-
-    tensor2d q = tensor_from_ggml_2d(q_tensor);
-    tensor2d k = tensor_from_ggml_2d(k_tensor);
-    tensor2d v = tensor_from_ggml_2d(v_tensor);
-    tensor2d p = tensor_from_ggml_2d(p_tensor);
+    tensor2d q = eval_linear(q_weight, q_bias, x, n_threads, runtime);
+    tensor2d k = eval_linear(k_weight, k_bias, x, n_threads, runtime);
+    tensor2d v = eval_linear(v_weight, v_bias, x, n_threads, runtime);
+    tensor2d p = eval_linear(pos_weight, nullptr, rel_pos, n_threads, runtime);
 
     tensor2d attn(hidden, length);
     const float * pos_u = tensor_data_f32(pos_bias_u);
@@ -1341,7 +1708,7 @@ static tensor2d conformer_convolution(
     tensor2d cur = eval_linear_from_rank3_weight(pointwise1_w, pointwise1_b, x, n_threads, runtime);
     cur = glu(cur);
     zero_masked_positions(cur, valid_length);
-    cur = depthwise_conv1d(cur, depthwise_w, depthwise_b);
+    cur = depthwise_conv1d(cur, depthwise_w, depthwise_b, n_threads, runtime);
     apply_silu(cur);
     return eval_linear_from_rank3_weight(pointwise2_w, pointwise2_b, cur, n_threads, runtime);
 }
@@ -1453,7 +1820,7 @@ static tensor2d run_conv_subsampling(
             require_tensor(model, "encoder.pre_encode.conv0.weight"),
             require_tensor(model, "encoder.pre_encode.conv0.bias", GGML_TYPE_F32),
             x,
-            2, 2, 1, 1, n_threads);
+            2, 2, 1, 1, n_threads, runtime);
     current_length = conv_output_length_1d(current_length, 3, 2, 2);
     zero_masked_time_positions(x, current_length);
     apply_relu(x);
@@ -1462,7 +1829,7 @@ static tensor2d run_conv_subsampling(
             require_tensor(model, "encoder.pre_encode.conv1_dw.weight"),
             require_tensor(model, "encoder.pre_encode.conv1_dw.bias", GGML_TYPE_F32),
             x,
-            2, 2, 1, 1, n_threads);
+            2, 2, 1, 1, n_threads, runtime);
     current_length = conv_output_length_1d(current_length, 3, 2, 2);
     zero_masked_time_positions(x, current_length);
     x = eval_conv2d_pointwise(
@@ -1479,7 +1846,7 @@ static tensor2d run_conv_subsampling(
             require_tensor(model, "encoder.pre_encode.conv2_dw.weight"),
             require_tensor(model, "encoder.pre_encode.conv2_dw.bias", GGML_TYPE_F32),
             x,
-            2, 2, 1, 1, n_threads);
+            2, 2, 1, 1, n_threads, runtime);
     current_length = conv_output_length_1d(current_length, 3, 2, 2);
     zero_masked_time_positions(x, current_length);
     x = eval_conv2d_pointwise(
@@ -2016,30 +2383,18 @@ static std::vector<cross_kv_cache> build_cross_kv(
     std::vector<cross_kv_cache> caches(size_t(model.decoder.num_layers));
     for (int32_t il = 0; il < model.decoder.num_layers; ++il) {
         const std::string prefix = format("decoder.layers.%d.cross_attn.", il);
-        ggml_ptr ctx_holder;
-        struct ggml_context * ctx = begin_linear_workspace(runtime);
-        if (ctx == nullptr) {
-            ctx_holder = make_compute_ctx();
-            ctx = ctx_holder.get();
-        }
-
-        struct ggml_tensor * key_weight = require_tensor(model, prefix + "key.weight");
-        struct ggml_tensor * value_weight = require_tensor(model, prefix + "value.weight");
-        struct ggml_tensor * src = create_matmul_input_tensor_2d(ctx, key_weight, encoder_states, runtime);
-        struct ggml_tensor * key_tensor = build_linear_graph(
-                ctx,
-                key_weight,
+        caches[size_t(il)].key = eval_linear(
+                require_tensor(model, prefix + "key.weight"),
                 require_tensor(model, prefix + "key.bias", GGML_TYPE_F32),
-                src);
-        struct ggml_tensor * value_tensor = build_linear_graph(
-                ctx,
-                value_weight,
+                encoder_states,
+                n_threads,
+                runtime);
+        caches[size_t(il)].value = eval_linear(
+                require_tensor(model, prefix + "value.weight"),
                 require_tensor(model, prefix + "value.bias", GGML_TYPE_F32),
-                src);
-        run_graph_outputs(ctx, { key_tensor, value_tensor }, n_threads, runtime);
-
-        caches[size_t(il)].key = tensor_from_ggml_2d(key_tensor);
-        caches[size_t(il)].value = tensor_from_ggml_2d(value_tensor);
+                encoder_states,
+                n_threads,
+                runtime);
     }
     return caches;
 }
@@ -2492,6 +2847,122 @@ static void load_tokenizer_metadata(model & out) {
     }
 }
 
+static void load_model_common_metadata(model & out) {
+    const std::string architecture = gguf_get_str_or_throw(out.gguf, GGUF_ARCH_KEY);
+    if (architecture != GGUF_ARCH_VALUE) {
+        throw std::runtime_error(format(
+                "unsupported architecture '%s' (expected '%s')",
+                architecture.c_str(),
+                GGUF_ARCH_VALUE));
+    }
+
+    out.max_audio_clip_s = gguf_get_f32_or_throw(out.gguf, gguf_key("max_audio_clip_s"));
+
+    out.frontend.sample_rate = gguf_get_i32_or_throw(out.gguf, gguf_key("frontend.sample_rate"));
+    out.frontend.n_mels = gguf_get_i32_or_throw(out.gguf, gguf_key("frontend.n_mels"));
+    out.frontend.n_fft = gguf_get_i32_or_throw(out.gguf, gguf_key("frontend.n_fft"));
+    out.frontend.win_length = gguf_get_i32_or_throw(out.gguf, gguf_key("frontend.win_length"));
+    out.frontend.hop_length = gguf_get_i32_or_throw(out.gguf, gguf_key("frontend.hop_length"));
+    out.frontend.fmin = gguf_get_f32_or_throw(out.gguf, gguf_key("frontend.fmin"));
+    out.frontend.fmax = gguf_get_f32_or_throw(out.gguf, gguf_key("frontend.fmax"));
+    out.frontend.preemph = gguf_get_f32_or_throw(out.gguf, gguf_key("frontend.preemph"));
+    out.frontend.dither = gguf_get_f32_or_throw(out.gguf, gguf_key("frontend.dither"));
+    out.frontend.log_zero_guard = gguf_get_f32_or_throw(out.gguf, gguf_key("frontend.log_zero_guard"));
+    out.frontend.normalize_per_feature = gguf_get_bool_or_throw(out.gguf, gguf_key("frontend.normalize_per_feature"));
+    if (gguf_has_key(out.gguf, gguf_key("frontend.window"))) {
+        out.frontend.window = gguf_get_scalar_array_or_throw<float>(out.gguf, gguf_key("frontend.window"), GGUF_TYPE_FLOAT32);
+    }
+    out.frontend.mel_filters = gguf_get_scalar_array_or_throw<float>(out.gguf, gguf_key("frontend.mel_filters"), GGUF_TYPE_FLOAT32);
+
+    out.encoder.d_model = gguf_get_i32_or_throw(out.gguf, gguf_key("encoder.d_model"));
+    out.encoder.feat_in = gguf_get_i32_or_throw(out.gguf, gguf_key("encoder.feat_in"));
+    out.encoder.feat_out = gguf_get_i32_or_throw(out.gguf, gguf_key("encoder.feat_out"));
+    out.encoder.n_layers = gguf_get_i32_or_throw(out.gguf, gguf_key("encoder.n_layers"));
+    out.encoder.n_heads = gguf_get_i32_or_throw(out.gguf, gguf_key("encoder.n_heads"));
+    out.encoder.ff_expansion_factor = gguf_get_i32_or_throw(out.gguf, gguf_key("encoder.ff_expansion_factor"));
+    out.encoder.conv_kernel_size = gguf_get_i32_or_throw(out.gguf, gguf_key("encoder.conv_kernel_size"));
+    out.encoder.subsampling_factor = gguf_get_i32_or_throw(out.gguf, gguf_key("encoder.subsampling_factor"));
+    out.encoder.subsampling_conv_channels = gguf_get_i32_or_throw(out.gguf, gguf_key("encoder.subsampling_conv_channels"));
+    out.encoder.pos_emb_max_len = gguf_get_i32_or_throw(out.gguf, gguf_key("encoder.pos_emb_max_len"));
+
+    out.decoder.hidden_size = gguf_get_i32_or_throw(out.gguf, gguf_key("decoder.hidden_size"));
+    out.decoder.inner_size = gguf_get_i32_or_throw(out.gguf, gguf_key("decoder.inner_size"));
+    out.decoder.num_attention_heads = gguf_get_i32_or_throw(out.gguf, gguf_key("decoder.num_attention_heads"));
+    out.decoder.num_layers = gguf_get_i32_or_throw(out.gguf, gguf_key("decoder.num_layers"));
+    out.decoder.max_sequence_length = gguf_get_i32_or_throw(out.gguf, gguf_key("decoder.max_sequence_length"));
+    out.decoder.hidden_act = gguf_get_str_or_throw(out.gguf, gguf_key("decoder.hidden_act"));
+
+    out.head.hidden_size = gguf_get_i32_or_throw(out.gguf, gguf_key("head.hidden_size"));
+    out.head.num_classes = gguf_get_i32_or_throw(out.gguf, gguf_key("head.num_classes"));
+    out.head.log_softmax = gguf_get_bool_or_throw(out.gguf, gguf_key("head.log_softmax"));
+
+    out.has_encoder_decoder_proj = gguf_get_bool_or_throw(out.gguf, gguf_key("encoder_decoder_proj"));
+
+    load_tokenizer_metadata(out);
+}
+
+static void populate_model_tensor_map(model & out) {
+    out.tensors.clear();
+    const int64_t n_tensors = gguf_get_n_tensors(out.gguf);
+    for (int64_t i = 0; i < n_tensors; ++i) {
+        const char * name = gguf_get_tensor_name(out.gguf, i);
+        out.tensors[name] = ggml_get_tensor(out.weights, name);
+    }
+}
+
+static backend_model_data * get_backend_model(model & model) {
+    return reinterpret_cast<backend_model_data *>(model.impl);
+}
+
+static const backend_model_data * get_backend_model(const model & model) {
+    return reinterpret_cast<const backend_model_data *>(model.impl);
+}
+
+static backend_state_data * get_backend_state(state & state) {
+    return reinterpret_cast<backend_state_data *>(state.impl);
+}
+
+static const backend_state_data * get_backend_state(const state & state) {
+    return reinterpret_cast<const backend_state_data *>(state.impl);
+}
+
+static bool runtime_uses_backend(const inference_runtime * runtime) {
+    return runtime != nullptr &&
+            runtime->backend_model != nullptr &&
+            runtime->backend_state != nullptr &&
+            !runtime->backend_state->legacy_cpu &&
+            runtime->backend_model->use_gpu_active &&
+            !runtime->backend_state->backends.empty();
+}
+
+static struct ggml_tensor * maybe_backend_tensor(
+        inference_runtime * runtime,
+        const struct ggml_tensor * tensor) {
+    if (tensor == nullptr || !runtime_uses_backend(runtime)) {
+        return const_cast<struct ggml_tensor *>(tensor);
+    }
+
+    const std::map<std::string, struct ggml_tensor *>::const_iterator it =
+            runtime->backend_model->tensors.find(tensor->name);
+    if (it == runtime->backend_model->tensors.end()) {
+        return const_cast<struct ggml_tensor *>(tensor);
+    }
+
+    return it->second;
+}
+
+static void free_backend_model(model & model);
+static void free_backend_state(state & state);
+static bool load_model_backend(const std::string & path_model, model & out, const context_params & params, std::string & error);
+static bool init_state_backend(model & model, state & state, std::string & error);
+static bool transcribe_backend(
+        model & model,
+        state & state,
+        const std::vector<float> & pcmf32,
+        const transcribe_params & params,
+        std::string & text,
+        std::string & error);
+
 } // namespace
 
 bool tokenizer::is_language_supported(const std::string & language) const {
@@ -2576,6 +3047,292 @@ std::string tokenizer::detokenize(const std::vector<int32_t> & ids) const {
     return sanitize_utf8(bytes);
 }
 
+namespace {
+
+static void clear_backend_model_data(backend_model_data & backend_model) {
+    for (ggml_backend_buffer_t buffer : backend_model.buffers) {
+        if (buffer != nullptr) {
+            ggml_backend_buffer_free(buffer);
+        }
+    }
+    backend_model.buffers.clear();
+    backend_model.tensors.clear();
+
+    for (struct ggml_context * ctx : backend_model.ctxs) {
+        if (ctx != nullptr) {
+            ggml_free(ctx);
+        }
+    }
+    backend_model.ctxs.clear();
+
+    backend_model.device = nullptr;
+    backend_model.use_gpu_active = false;
+    backend_model.backend_name = "cpu";
+}
+
+static ggml_backend_dev_t find_requested_gpu_device(int32_t gpu_device) {
+    int32_t cur_gpu = 0;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
+        if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            continue;
+        }
+
+        if (cur_gpu == gpu_device) {
+            return dev;
+        }
+
+        ++cur_gpu;
+    }
+
+    return nullptr;
+}
+
+static ggml_backend_t cohere_backend_init_gpu(const context_params & params) {
+    ggml_backend_dev_t dev = find_requested_gpu_device(params.gpu_device);
+    if (dev == nullptr) {
+        return nullptr;
+    }
+
+    ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+    if (backend == nullptr) {
+        return nullptr;
+    }
+
+    return backend;
+}
+
+static std::vector<ggml_backend_t> cohere_backend_init(const context_params & params) {
+    std::vector<ggml_backend_t> backends;
+
+    if (params.use_gpu) {
+        if (ggml_backend_t backend_gpu = cohere_backend_init_gpu(params)) {
+            backends.push_back(backend_gpu);
+        }
+    }
+
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
+            if (ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr)) {
+                backends.push_back(backend);
+            }
+        }
+    }
+
+    if (ggml_backend_t backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr)) {
+        backends.push_back(backend_cpu);
+    }
+
+    return backends;
+}
+
+static bool duplicate_model_tensors_to_backend(
+        model & out,
+        backend_model_data & backend_model,
+        ggml_backend_dev_t device,
+        std::string & error) {
+    ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(device);
+    if (buft == nullptr) {
+        error = format("backend '%s' does not expose a default buffer type", ggml_backend_dev_name(device));
+        return false;
+    }
+
+    const size_t n_tensors = std::max<size_t>(1, out.tensors.size());
+    struct ggml_init_params init_params = {
+        /*.mem_size   =*/ n_tensors * ggml_tensor_overhead() + ggml_graph_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+
+    struct ggml_context * ctx = ggml_init(init_params);
+    if (ctx == nullptr) {
+        error = "failed to allocate Cohere backend tensor context";
+        return false;
+    }
+
+    backend_model.ctxs.push_back(ctx);
+
+    for (std::map<std::string, struct ggml_tensor *>::const_iterator it = out.tensors.begin(); it != out.tensors.end(); ++it) {
+        struct ggml_tensor * dup = ggml_dup_tensor(ctx, it->second);
+        if (dup == nullptr) {
+            error = format("failed to duplicate tensor '%s' for backend loading", it->first.c_str());
+            return false;
+        }
+        ggml_set_name(dup, it->first.c_str());
+        backend_model.tensors[it->first] = dup;
+    }
+
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (buffer == nullptr) {
+        error = format("failed to allocate backend weights buffer for '%s'", ggml_backend_dev_name(device));
+        return false;
+    }
+    backend_model.buffers.push_back(buffer);
+
+    for (std::map<std::string, struct ggml_tensor *>::const_iterator it = out.tensors.begin(); it != out.tensors.end(); ++it) {
+        struct ggml_tensor * src = it->second;
+        struct ggml_tensor * dst = backend_model.tensors[it->first];
+        if (src == nullptr || src->data == nullptr || dst == nullptr) {
+            error = format("failed to resolve tensor '%s' during backend copy", it->first.c_str());
+            return false;
+        }
+        ggml_backend_tensor_set(dst, src->data, 0, ggml_nbytes(src));
+    }
+
+    ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    backend_model.device = device;
+    backend_model.backend_name = ggml_backend_dev_name(device);
+    backend_model.use_gpu_active = true;
+    backend_model.max_valid_mel_frames = std::max(
+            1,
+            int32_t((out.max_audio_clip_s * out.frontend.sample_rate) / std::max(1, out.frontend.hop_length)));
+    backend_model.max_mel_frames = backend_model.max_valid_mel_frames;
+    backend_model.max_encoder_valid_length = std::min(
+            conv_subsampling_output_length(backend_model.max_valid_mel_frames),
+            out.encoder.pos_emb_max_len);
+    backend_model.max_encoder_length = backend_model.max_encoder_valid_length;
+    backend_model.cross_hidden_size = out.has_encoder_decoder_proj ? out.decoder.hidden_size : out.encoder.d_model;
+
+    return true;
+}
+
+static void free_backend_model(model & model) {
+    backend_model_data * backend_model = get_backend_model(model);
+    if (backend_model == nullptr) {
+        return;
+    }
+
+    clear_backend_model_data(*backend_model);
+    delete backend_model;
+    model.impl = nullptr;
+}
+
+static bool load_model_backend(const std::string & path_model, model & out, const context_params & params, std::string & error) {
+    if (!cohere::load_model(path_model, out, error)) {
+        return false;
+    }
+
+    std::unique_ptr<backend_model_data> backend_model(new backend_model_data());
+    backend_model->params = params;
+    backend_model->path_model = path_model;
+    backend_model->backend_name = "cpu";
+
+    if (params.use_gpu) {
+        ggml_backend_load_all();
+        if (ggml_backend_dev_t device = find_requested_gpu_device(params.gpu_device)) {
+            std::string backend_error;
+            if (!duplicate_model_tensors_to_backend(out, *backend_model, device, backend_error)) {
+                clear_backend_model_data(*backend_model);
+            }
+        }
+    }
+
+    out.impl = backend_model.release();
+    error.clear();
+    return true;
+}
+
+static void free_backend_state(state & state) {
+    backend_state_data * backend_state = get_backend_state(state);
+    if (backend_state == nullptr) {
+        return;
+    }
+
+    if (backend_state->sched_conv.sched != nullptr) {
+        ggml_backend_sched_free(backend_state->sched_conv.sched);
+    }
+    if (backend_state->sched_encode.sched != nullptr) {
+        ggml_backend_sched_free(backend_state->sched_encode.sched);
+    }
+    if (backend_state->sched_cross.sched != nullptr) {
+        ggml_backend_sched_free(backend_state->sched_cross.sched);
+    }
+    if (backend_state->sched_decode.sched != nullptr) {
+        ggml_backend_sched_free(backend_state->sched_decode.sched);
+    }
+
+    if (backend_state->kv_self.buffer != nullptr) {
+        ggml_backend_buffer_free(backend_state->kv_self.buffer);
+    }
+    if (backend_state->kv_cross.buffer != nullptr) {
+        ggml_backend_buffer_free(backend_state->kv_cross.buffer);
+    }
+    if (backend_state->tensor_buffer != nullptr) {
+        ggml_backend_buffer_free(backend_state->tensor_buffer);
+    }
+
+    for (ggml_backend_t backend : backend_state->backends) {
+        if (backend != nullptr) {
+            ggml_backend_free(backend);
+        }
+    }
+
+    delete backend_state;
+    state.impl = nullptr;
+}
+
+static bool init_state_backend(model & model, state & state, std::string & error) {
+    free_backend_state(state);
+
+    std::unique_ptr<backend_state_data> backend_state(new backend_state_data());
+    const backend_model_data * backend_model = get_backend_model(model);
+
+    if (backend_model == nullptr || !backend_model->use_gpu_active || !backend_model->params.use_gpu) {
+        backend_state->legacy_cpu = true;
+        backend_state->backend_name = "cpu";
+        state.impl = backend_state.release();
+        error.clear();
+        return true;
+    }
+
+    ggml_backend_load_all();
+    backend_state->params = backend_model->params;
+    backend_state->backends = cohere_backend_init(backend_model->params);
+
+    bool have_gpu_backend = false;
+    for (ggml_backend_t backend : backend_state->backends) {
+        if (backend == nullptr) {
+            continue;
+        }
+        const enum ggml_backend_dev_type type = ggml_backend_dev_type(ggml_backend_get_device(backend));
+        if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            have_gpu_backend = true;
+            backend_state->backend_name = ggml_backend_name(backend);
+            break;
+        }
+    }
+
+    if (!have_gpu_backend) {
+        for (ggml_backend_t backend : backend_state->backends) {
+            if (backend != nullptr) {
+                ggml_backend_free(backend);
+            }
+        }
+        backend_state->backends.clear();
+        backend_state->legacy_cpu = true;
+        backend_state->backend_name = "cpu";
+    } else {
+        backend_state->legacy_cpu = false;
+    }
+
+    state.impl = backend_state.release();
+    error.clear();
+    return true;
+}
+
+static bool transcribe_backend(
+        model & model,
+        state & state,
+        const std::vector<float> & pcmf32,
+        const transcribe_params & params,
+        std::string & text,
+        std::string & error);
+
+} // namespace
+
 bool load_model(const std::string & path_model, model & out, std::string & error) {
     free_model(out);
 
@@ -2593,64 +3350,8 @@ bool load_model(const std::string & path_model, model & out, std::string & error
             throw std::runtime_error(format("failed to load GGUF model '%s'", path_model.c_str()));
         }
 
-        const std::string architecture = gguf_get_str_or_throw(out.gguf, GGUF_ARCH_KEY);
-        if (architecture != GGUF_ARCH_VALUE) {
-            throw std::runtime_error(format(
-                    "unsupported architecture '%s' (expected '%s')",
-                    architecture.c_str(),
-                    GGUF_ARCH_VALUE));
-        }
-
-        out.max_audio_clip_s = gguf_get_f32_or_throw(out.gguf, gguf_key("max_audio_clip_s"));
-
-        out.frontend.sample_rate = gguf_get_i32_or_throw(out.gguf, gguf_key("frontend.sample_rate"));
-        out.frontend.n_mels = gguf_get_i32_or_throw(out.gguf, gguf_key("frontend.n_mels"));
-        out.frontend.n_fft = gguf_get_i32_or_throw(out.gguf, gguf_key("frontend.n_fft"));
-        out.frontend.win_length = gguf_get_i32_or_throw(out.gguf, gguf_key("frontend.win_length"));
-        out.frontend.hop_length = gguf_get_i32_or_throw(out.gguf, gguf_key("frontend.hop_length"));
-        out.frontend.fmin = gguf_get_f32_or_throw(out.gguf, gguf_key("frontend.fmin"));
-        out.frontend.fmax = gguf_get_f32_or_throw(out.gguf, gguf_key("frontend.fmax"));
-        out.frontend.preemph = gguf_get_f32_or_throw(out.gguf, gguf_key("frontend.preemph"));
-        out.frontend.dither = gguf_get_f32_or_throw(out.gguf, gguf_key("frontend.dither"));
-        out.frontend.log_zero_guard = gguf_get_f32_or_throw(out.gguf, gguf_key("frontend.log_zero_guard"));
-        out.frontend.normalize_per_feature = gguf_get_bool_or_throw(out.gguf, gguf_key("frontend.normalize_per_feature"));
-        if (gguf_has_key(out.gguf, gguf_key("frontend.window"))) {
-            out.frontend.window = gguf_get_scalar_array_or_throw<float>(out.gguf, gguf_key("frontend.window"), GGUF_TYPE_FLOAT32);
-        }
-        out.frontend.mel_filters = gguf_get_scalar_array_or_throw<float>(out.gguf, gguf_key("frontend.mel_filters"), GGUF_TYPE_FLOAT32);
-
-        out.encoder.d_model = gguf_get_i32_or_throw(out.gguf, gguf_key("encoder.d_model"));
-        out.encoder.feat_in = gguf_get_i32_or_throw(out.gguf, gguf_key("encoder.feat_in"));
-        out.encoder.feat_out = gguf_get_i32_or_throw(out.gguf, gguf_key("encoder.feat_out"));
-        out.encoder.n_layers = gguf_get_i32_or_throw(out.gguf, gguf_key("encoder.n_layers"));
-        out.encoder.n_heads = gguf_get_i32_or_throw(out.gguf, gguf_key("encoder.n_heads"));
-        out.encoder.ff_expansion_factor = gguf_get_i32_or_throw(out.gguf, gguf_key("encoder.ff_expansion_factor"));
-        out.encoder.conv_kernel_size = gguf_get_i32_or_throw(out.gguf, gguf_key("encoder.conv_kernel_size"));
-        out.encoder.subsampling_factor = gguf_get_i32_or_throw(out.gguf, gguf_key("encoder.subsampling_factor"));
-        out.encoder.subsampling_conv_channels = gguf_get_i32_or_throw(out.gguf, gguf_key("encoder.subsampling_conv_channels"));
-        out.encoder.pos_emb_max_len = gguf_get_i32_or_throw(out.gguf, gguf_key("encoder.pos_emb_max_len"));
-
-        out.decoder.hidden_size = gguf_get_i32_or_throw(out.gguf, gguf_key("decoder.hidden_size"));
-        out.decoder.inner_size = gguf_get_i32_or_throw(out.gguf, gguf_key("decoder.inner_size"));
-        out.decoder.num_attention_heads = gguf_get_i32_or_throw(out.gguf, gguf_key("decoder.num_attention_heads"));
-        out.decoder.num_layers = gguf_get_i32_or_throw(out.gguf, gguf_key("decoder.num_layers"));
-        out.decoder.max_sequence_length = gguf_get_i32_or_throw(out.gguf, gguf_key("decoder.max_sequence_length"));
-        out.decoder.hidden_act = gguf_get_str_or_throw(out.gguf, gguf_key("decoder.hidden_act"));
-
-        out.head.hidden_size = gguf_get_i32_or_throw(out.gguf, gguf_key("head.hidden_size"));
-        out.head.num_classes = gguf_get_i32_or_throw(out.gguf, gguf_key("head.num_classes"));
-        out.head.log_softmax = gguf_get_bool_or_throw(out.gguf, gguf_key("head.log_softmax"));
-
-        out.has_encoder_decoder_proj = gguf_get_bool_or_throw(out.gguf, gguf_key("encoder_decoder_proj"));
-
-        load_tokenizer_metadata(out);
-
-        out.tensors.clear();
-        const int64_t n_tensors = gguf_get_n_tensors(out.gguf);
-        for (int64_t i = 0; i < n_tensors; ++i) {
-            const char * name = gguf_get_tensor_name(out.gguf, i);
-            out.tensors[name] = ggml_get_tensor(out.weights, name);
-        }
+        load_model_common_metadata(out);
+        populate_model_tensor_map(out);
 
         validate_model(out);
         return true;
@@ -2661,7 +3362,20 @@ bool load_model(const std::string & path_model, model & out, std::string & error
     }
 }
 
+context_params context_default_params() {
+    context_params params;
+    params.use_gpu = true;
+    params.flash_attn = true;
+    params.gpu_device = 0;
+    return params;
+}
+
+bool load_model(const std::string & path_model, model & out, const context_params & params, std::string & error) {
+    return load_model_backend(path_model, out, params, error);
+}
+
 void free_model(model & model) {
+    free_backend_model(model);
     model.tensors.clear();
     if (model.weights != nullptr) {
         ggml_free(model.weights);
@@ -2678,6 +3392,7 @@ void free_model(model & model) {
     model.vocab = tokenizer();
     model.max_audio_clip_s = 0.0f;
     model.has_encoder_decoder_proj = false;
+    model.impl = nullptr;
 }
 
 int32_t conv_subsampling_output_length(int32_t n_frames) {
@@ -2714,7 +3429,8 @@ static bool run_inference(
         const std::vector<float> & pcmf32,
         const transcribe_params & params,
         std::string & text,
-        std::string & error) {
+        std::string & error,
+        backend_state_data * backend_state = nullptr) {
     text.clear();
     error.clear();
 
@@ -2738,6 +3454,12 @@ static bool run_inference(
         const int32_t n_threads = std::max(1, params.n_threads);
         configure_blas_threads_for_inference(n_threads);
         inference_runtime runtime;
+        runtime.backend_model = get_backend_model(model);
+        runtime.backend_state = backend_state;
+        if (!runtime_uses_backend(&runtime)) {
+            runtime.backend_model = nullptr;
+            runtime.backend_state = nullptr;
+        }
         int32_t encoder_length = 0;
         tensor2d decoder_memory = run_encoder(model, pcmf32, n_threads, encoder_length, &runtime);
         std::vector<cross_kv_cache> cross_kv;
@@ -2788,6 +3510,49 @@ bool transcribe(
         std::string & text,
         std::string & error) {
     return run_inference(model, pcmf32, params, text, error);
+}
+
+bool init_state(model & model, state & state, std::string & error) {
+    return init_state_backend(model, state, error);
+}
+
+void free_state(state & state) {
+    free_backend_state(state);
+}
+
+namespace {
+
+static bool transcribe_backend(
+        model & model,
+        state & state,
+        const std::vector<float> & pcmf32,
+        const transcribe_params & params,
+        std::string & text,
+        std::string & error) {
+    backend_state_data * backend_state = get_backend_state(state);
+    if (backend_state == nullptr || backend_state->legacy_cpu) {
+        return run_inference(model, pcmf32, params, text, error);
+    }
+
+    return run_inference(model, pcmf32, params, text, error, backend_state);
+}
+
+} // namespace
+
+bool transcribe_with_state(
+        model & model,
+        state & state,
+        const std::vector<float> & pcmf32,
+        const transcribe_params & params,
+        std::string & text,
+        std::string & error) {
+    if (state.impl == nullptr) {
+        if (!init_state(model, state, error)) {
+            return false;
+        }
+    }
+
+    return transcribe_backend(model, state, pcmf32, params, text, error);
 }
 
 } // namespace cohere

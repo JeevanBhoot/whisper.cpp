@@ -12,6 +12,12 @@ struct ggml_tensor;
 
 namespace cohere {
 
+struct context_params {
+    bool use_gpu = true;
+    bool flash_attn = true;
+    int32_t gpu_device = 0;
+};
+
 struct frontend_config {
     int32_t sample_rate = 16000;
     int32_t n_mels = 128;
@@ -84,6 +90,8 @@ struct model {
     bool has_encoder_decoder_proj = false;
 
     std::map<std::string, struct ggml_tensor *> tensors;
+
+    void * impl = nullptr;
 };
 
 struct transcribe_params {
@@ -93,11 +101,29 @@ struct transcribe_params {
     bool punctuation = true;
 };
 
+struct state {
+    void * impl = nullptr;
+};
+
+context_params context_default_params();
+
 bool load_model(const std::string & path_model, model & out, std::string & error);
+bool load_model(const std::string & path_model, model & out, const context_params & params, std::string & error);
 void free_model(model & model);
+
+bool init_state(model & model, state & state, std::string & error);
+void free_state(state & state);
 
 bool transcribe(
         model & model,
+        const std::vector<float> & pcmf32,
+        const transcribe_params & params,
+        std::string & text,
+        std::string & error);
+
+bool transcribe_with_state(
+        model & model,
+        state & state,
         const std::vector<float> & pcmf32,
         const transcribe_params & params,
         std::string & text,

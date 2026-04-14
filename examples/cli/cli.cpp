@@ -334,7 +334,8 @@ static void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params
     fprintf(stderr, "Cohere note:\n");
     fprintf(stderr, "  Cohere Transcribe GGUF models are detected automatically from model metadata.\n");
     fprintf(stderr, "  Cohere mode currently supports text-only transcription with -m/-f/-l/-t,\n");
-    fprintf(stderr, "  optional -np, and optional -otxt/-of text file output.\n");
+    fprintf(stderr, "  optional GPU flags (-ng/-dev/-fa/-nfa), optional -np,\n");
+    fprintf(stderr, "  and optional -otxt/-of text file output.\n");
     fprintf(stderr, "\n");
 }
 
@@ -344,6 +345,10 @@ static bool cohere_validate_cli_params(const whisper_params & params, std::strin
         "-f", "--file",
         "-l", "--language",
         "-t", "--threads",
+        "-ng", "--no-gpu",
+        "-dev", "--device",
+        "-fa", "--flash-attn",
+        "-nfa", "--no-flash-attn",
         "-np", "--no-prints",
         "-otxt", "--output-txt",
         "-of", "--output-file",
@@ -417,8 +422,20 @@ static int cohere_main(const whisper_params & params) {
     }
 
     cohere::model model;
-    if (!cohere::load_model(params.model, model, error)) {
+    cohere::context_params ctx_params = cohere::context_default_params();
+    ctx_params.use_gpu = params.use_gpu;
+    ctx_params.gpu_device = params.gpu_device;
+    ctx_params.flash_attn = params.flash_attn;
+
+    if (!cohere::load_model(params.model, model, ctx_params, error)) {
         fprintf(stderr, "error: failed to load Cohere model '%s': %s\n", params.model.c_str(), error.c_str());
+        return 3;
+    }
+
+    cohere::state state;
+    if (!cohere::init_state(model, state, error)) {
+        fprintf(stderr, "error: failed to initialize Cohere state: %s\n", error.c_str());
+        cohere::free_model(model);
         return 3;
     }
 
@@ -428,6 +445,7 @@ static int cohere_main(const whisper_params & params) {
                 "error: unsupported Cohere language '%s' (supported: %s)\n",
                 params.language.c_str(),
                 cohere_join_languages(model.vocab.supported_languages).c_str());
+        cohere::free_state(state);
         cohere::free_model(model);
         return 2;
     }
@@ -449,8 +467,9 @@ static int cohere_main(const whisper_params & params) {
         cparams.punctuation = true;
 
         std::string text;
-        if (!cohere::transcribe(model, pcmf32, cparams, text, error)) {
+        if (!cohere::transcribe_with_state(model, state, pcmf32, cparams, text, error)) {
             fprintf(stderr, "error: failed to process '%s': %s\n", fname_inp.c_str(), error.c_str());
+            cohere::free_state(state);
             cohere::free_model(model);
             return 10;
         }
@@ -460,11 +479,13 @@ static int cohere_main(const whisper_params & params) {
 
         if (!cohere_write_txt(params, f, fname_inp, text, error)) {
             fprintf(stderr, "error: %s\n", error.c_str());
+            cohere::free_state(state);
             cohere::free_model(model);
             return 11;
         }
     }
 
+    cohere::free_state(state);
     cohere::free_model(model);
     return 0;
 }
