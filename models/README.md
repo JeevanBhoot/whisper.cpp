@@ -85,20 +85,38 @@ hf auth login
 hf download CohereLabs/cohere-transcribe-03-2026 --local-dir ./artifacts/hf/cohere-transcribe
 ```
 
-Support for Cohere Transcribe is provided through a separate GGUF conversion script:
+Convert to GGUF:
 
 ```bash
-python3 ./models/convert-cohere-transcribe-to-gguf.py ./artifacts/hf/cohere-transcribe ./artifacts/gguf/cohere-transcribe
+python3 ./models/convert-cohere-transcribe-to-gguf.py ./artifacts/hf/cohere-transcribe ./artifacts/gguf/cohere-transcribe.gguf
 ```
 
 Once converted, `whisper-cli` will detect the Cohere architecture automatically:
 
 ```bash
-./build/bin/whisper-cli -m ./artifacts/gguf/cohere-transcribe -f samples/jfk.wav
+./build/bin/whisper-cli -m ./artifacts/gguf/cohere-transcribe.gguf -f samples/jfk.wav
 ```
 
 - Language tag: use `-l` / `--language`; the default is `en` (English).
 - GGUF size: `f16` is about 3.8 GB and `f32` is about 7.7 GB.
+
+### Quantizing Cohere Transcribe
+
+To reduce disk/RAM and improve throughput on edge devices, quantize the floating GGUF to a new quantized GGUF:
+
+```bash
+# Quantize to Q4_K (default)
+cmake -B build
+cmake --build build -j --config Release
+./build/bin/cohere-quantize ./artifacts/gguf/cohere-transcribe.gguf ./artifacts/gguf/cohere-transcribe-q4_k.gguf q4_k
+
+# Run the quantized model
+./build/bin/whisper-cli -m ./artifacts/gguf/cohere-transcribe-q4_k.gguf -f samples/jfk.wav -l en
+```
+
+Notes:
+- By default, the quantizer converts 2D linear/projection weights and skips biases, norms, token embeddings, and 3D/4D convolution kernels.
+- Supported types: `q4_k` (default), `q5_k`, `q6_k`, `q8_0`.
 
 ## Fine-tuned models
 

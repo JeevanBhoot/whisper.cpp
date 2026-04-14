@@ -178,6 +178,8 @@ cmake --build build -j --config Release
 ./build/bin/whisper-cli -m models/ggml-base.en-q5_0.bin ./samples/gb0.wav
 ```
 
+For Cohere Transcribe GGUF models, use `cohere-quantize` instead.
+
 ## Core ML support
 
 On Apple Silicon devices, the Encoder inference can be executed on the Apple Neural Engine (ANE) via Core ML. This can result in significant
