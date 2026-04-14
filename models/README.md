@@ -94,10 +94,12 @@ python3 ./models/convert-cohere-transcribe-to-gguf.py ./artifacts/hf/cohere-tran
 Once converted, `whisper-cli` will detect the Cohere architecture automatically:
 
 ```bash
-./build/bin/whisper-cli -m ./artifacts/gguf/cohere-transcribe -f samples/jfk.wav
+./build/bin/whisper-cli -m ./artifacts/gguf/cohere-transcribe -l en -f samples/jfk.wav
 ```
 
 - Language tag: use `-l` / `--language`; the default is `en` (English).
+- Long-form audio: clips longer than the model limit are chunked automatically after conversion.
+- Punctuation: enabled by default; disable it with `--no-punctuation`.
 - GGUF size: `f16` is about 3.8 GB and `f32` is about 7.7 GB.
 
 ## Fine-tuned models
