@@ -65,4 +65,4 @@ options:
   --grammar-penalty N            [100.0  ] scales down logits of nongrammar tokens
 ```
 
-`whisper-cli` also auto-detects Cohere Transcribe GGUF models from the model metadata. In Cohere mode, the CLI currently supports text-only transcription with `-m`, `-f`, `-l`, `-t`, optional `-np`, and optional `-otxt` / `-of`.
+`whisper-cli` also auto-detects Cohere Transcribe GGUF models from the model metadata. In Cohere mode, the CLI supports text-only transcription with `-m`, `-f`, `-l`, `-t`, automatic long-form chunking, optional `--no-punctuation`, optional `-np`, and optional `-otxt` / `-of`.

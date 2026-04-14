@@ -4,6 +4,7 @@
 #include "gguf.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
@@ -38,6 +39,8 @@ static const char * GGUF_ARCH_VALUE = "cohere-transcribe";
 static const char * GGUF_PREFIX = "cohere_transcribe.";
 static const float  LAYER_NORM_EPS = 1e-5f;
 static const size_t SCRATCH_SIZE = 512ull * 1024ull * 1024ull;
+static const float  DEFAULT_OVERLAP_CHUNK_SECOND = 5.0f;
+static const int32_t DEFAULT_MIN_ENERGY_WINDOW_SAMPLES = 1600;
 
 struct gguf_context_deleter {
     void operator()(struct gguf_context * ctx) const {
@@ -2602,6 +2605,12 @@ bool load_model(const std::string & path_model, model & out, std::string & error
         }
 
         out.max_audio_clip_s = gguf_get_f32_or_throw(out.gguf, gguf_key("max_audio_clip_s"));
+        out.overlap_chunk_second = gguf_has_key(out.gguf, gguf_key("overlap_chunk_second"))
+                ? gguf_get_f32_or_throw(out.gguf, gguf_key("overlap_chunk_second"))
+                : DEFAULT_OVERLAP_CHUNK_SECOND;
+        out.min_energy_window_samples = gguf_has_key(out.gguf, gguf_key("min_energy_window_samples"))
+                ? gguf_get_i32_or_throw(out.gguf, gguf_key("min_energy_window_samples"))
+                : DEFAULT_MIN_ENERGY_WINDOW_SAMPLES;
 
         out.frontend.sample_rate = gguf_get_i32_or_throw(out.gguf, gguf_key("frontend.sample_rate"));
         out.frontend.n_mels = gguf_get_i32_or_throw(out.gguf, gguf_key("frontend.n_mels"));
@@ -2677,6 +2686,8 @@ void free_model(model & model) {
     model.head = head_config();
     model.vocab = tokenizer();
     model.max_audio_clip_s = 0.0f;
+    model.overlap_chunk_second = DEFAULT_OVERLAP_CHUNK_SECOND;
+    model.min_energy_window_samples = DEFAULT_MIN_ENERGY_WINDOW_SAMPLES;
     model.has_encoder_decoder_proj = false;
 }
 
@@ -2709,6 +2720,183 @@ std::vector<float> rel_shift_reference(
     return out;
 }
 
+struct audio_chunk_range {
+    size_t start = 0;
+    size_t end = 0;
+};
+
+static bool uses_no_space_chunk_separator(const std::string & language) {
+    return language == "ja" || language == "zh";
+}
+
+static std::string trim_ascii_whitespace(const std::string & text) {
+    size_t start = 0;
+    while (start < text.size() && std::isspace((unsigned char) text[start])) {
+        ++start;
+    }
+
+    size_t end = text.size();
+    while (end > start && std::isspace((unsigned char) text[end - 1])) {
+        --end;
+    }
+
+    return text.substr(start, end - start);
+}
+
+static size_t seconds_to_samples(float seconds, int32_t sample_rate) {
+    const long long samples = std::llround(double(seconds) * double(sample_rate));
+    return size_t(std::max<long long>(1, samples));
+}
+
+static size_t find_split_point_energy(
+        const std::vector<float> & waveform,
+        size_t start_idx,
+        size_t end_idx,
+        int32_t min_energy_window_samples) {
+    const size_t segment_size = end_idx - start_idx;
+    const size_t window_size = size_t(std::max(1, min_energy_window_samples));
+
+    if (segment_size <= window_size) {
+        return (start_idx + end_idx) / 2;
+    }
+
+    float min_energy = std::numeric_limits<float>::infinity();
+    size_t quietest_idx = start_idx;
+    const size_t upper = segment_size - window_size;
+
+    for (size_t i = 0; i < upper; i += window_size) {
+        double sumsq = 0.0;
+        for (size_t j = 0; j < window_size; ++j) {
+            const float value = waveform[start_idx + i + j];
+            sumsq += double(value) * double(value);
+        }
+
+        const float energy = std::sqrt(float(sumsq / double(window_size)));
+        if (energy < min_energy) {
+            min_energy = energy;
+            quietest_idx = start_idx + i;
+        }
+    }
+
+    return quietest_idx;
+}
+
+static std::vector<audio_chunk_range> split_audio_chunks_energy(
+        const std::vector<float> & waveform,
+        int32_t sample_rate,
+        float max_audio_clip_s,
+        float overlap_chunk_second,
+        int32_t min_energy_window_samples) {
+    const size_t chunk_size = seconds_to_samples(max_audio_clip_s, sample_rate);
+    const size_t boundary_context_size = seconds_to_samples(overlap_chunk_second, sample_rate);
+    const size_t total_samples = waveform.size();
+
+    if (total_samples <= chunk_size) {
+        return {{0, total_samples}};
+    }
+
+    std::vector<audio_chunk_range> chunks;
+    size_t idx = 0;
+    while (idx < total_samples) {
+        if (idx + chunk_size >= total_samples) {
+            chunks.push_back({idx, total_samples});
+            break;
+        }
+
+        const size_t search_start = std::max(idx, idx + chunk_size - boundary_context_size);
+        const size_t search_end = std::min(idx + chunk_size, total_samples);
+
+        size_t split_point = idx + chunk_size;
+        if (search_end > search_start) {
+            split_point = find_split_point_energy(
+                    waveform,
+                    search_start,
+                    search_end,
+                    min_energy_window_samples);
+        }
+
+        split_point = std::max(idx + 1, std::min(split_point, total_samples));
+        chunks.push_back({idx, split_point});
+        idx = split_point;
+    }
+
+    return chunks;
+}
+
+static std::vector<float> copy_audio_chunk(
+        const std::vector<float> & waveform,
+        const audio_chunk_range & chunk) {
+    const std::vector<float>::const_iterator begin = waveform.begin() + (std::vector<float>::difference_type) chunk.start;
+    const std::vector<float>::const_iterator end = waveform.begin() + (std::vector<float>::difference_type) chunk.end;
+    return std::vector<float>(begin, end);
+}
+
+static std::string join_chunk_texts(
+        const std::vector<std::string> & texts,
+        const std::string & separator) {
+    std::string joined;
+    for (size_t i = 0; i < texts.size(); ++i) {
+        const std::string part = trim_ascii_whitespace(texts[i]);
+        if (part.empty()) {
+            continue;
+        }
+
+        if (!joined.empty()) {
+            joined += separator;
+        }
+        joined += part;
+    }
+
+    return joined;
+}
+
+static std::string decode_single_segment(
+        model & model,
+        const std::vector<float> & pcmf32,
+        const transcribe_params & params,
+        int32_t n_threads) {
+    if (pcmf32.empty()) {
+        throw std::runtime_error("audio is empty");
+    }
+
+    inference_runtime runtime;
+    int32_t encoder_length = 0;
+    tensor2d decoder_memory = run_encoder(model, pcmf32, n_threads, encoder_length, &runtime);
+    std::vector<cross_kv_cache> cross_kv = build_cross_kv(model, decoder_memory, n_threads, &runtime);
+    std::vector<self_kv_cache> self_kv = build_self_kv(model);
+
+    const std::vector<int32_t> prompt = model.vocab.build_prompt(params.language, params.punctuation);
+    const int32_t eos_token_id = model.vocab.special_token_id("<|endoftext|>");
+
+    if ((int32_t) prompt.size() > model.decoder.max_sequence_length) {
+        throw std::runtime_error("decoder prompt exceeds decoder max sequence length");
+    }
+
+    std::vector<int32_t> generated;
+    generated.reserve(size_t(std::max(0, params.max_new_tokens)));
+
+    int32_t current_position = 0;
+    std::vector<float> logits;
+    for (size_t i = 0; i < prompt.size(); ++i) {
+        const bool need_logits = (i + 1 == prompt.size());
+        logits = decoder_step(model, prompt[i], current_position++, cross_kv, self_kv, n_threads, need_logits, &runtime);
+    }
+
+    const int32_t remaining = std::max(0, model.decoder.max_sequence_length - current_position);
+    const int32_t max_new_tokens = std::min(std::max(0, params.max_new_tokens), remaining);
+    for (int32_t i = 0; i < max_new_tokens; ++i) {
+        const int32_t next = argmax(logits);
+        if (next == eos_token_id) {
+            break;
+        }
+        generated.push_back(next);
+        logits = decoder_step(model, next, current_position++, cross_kv, self_kv, n_threads, true, &runtime);
+    }
+
+    GGML_UNUSED(encoder_length);
+    return model.vocab.detokenize(generated);
+}
+
 static bool run_inference(
         model & model,
         const std::vector<float> & pcmf32,
@@ -2727,53 +2915,30 @@ static bool run_inference(
             throw std::runtime_error("audio is empty");
         }
 
-        const float duration_s = float(pcmf32.size()) / float(model.frontend.sample_rate);
-        if (model.max_audio_clip_s > 0.0f && duration_s > model.max_audio_clip_s) {
-            throw std::runtime_error(format(
-                    "audio is too long for v0 (%0.2fs > max %0.2fs); long-form chunking is not implemented",
-                    duration_s,
-                    model.max_audio_clip_s));
-        }
-
         const int32_t n_threads = std::max(1, params.n_threads);
         configure_blas_threads_for_inference(n_threads);
-        inference_runtime runtime;
-        int32_t encoder_length = 0;
-        tensor2d decoder_memory = run_encoder(model, pcmf32, n_threads, encoder_length, &runtime);
-        std::vector<cross_kv_cache> cross_kv;
-        cross_kv = build_cross_kv(model, decoder_memory, n_threads, &runtime);
-        std::vector<self_kv_cache> self_kv = build_self_kv(model);
 
-        const std::vector<int32_t> prompt = model.vocab.build_prompt(params.language, params.punctuation);
-        const int32_t eos_token_id = model.vocab.special_token_id("<|endoftext|>");
-
-        if ((int32_t) prompt.size() > model.decoder.max_sequence_length) {
-            throw std::runtime_error("decoder prompt exceeds decoder max sequence length");
+        const double duration_s = double(pcmf32.size()) / double(model.frontend.sample_rate);
+        const double fast_path_threshold_s = std::max(0.0f, model.max_audio_clip_s - model.overlap_chunk_second);
+        if (model.max_audio_clip_s <= 0.0f || duration_s <= fast_path_threshold_s) {
+            text = decode_single_segment(model, pcmf32, params, n_threads);
+            return true;
         }
 
-        std::vector<int32_t> generated;
-        generated.reserve(size_t(params.max_new_tokens));
+        const std::vector<audio_chunk_range> chunks = split_audio_chunks_energy(
+                pcmf32,
+                model.frontend.sample_rate,
+                model.max_audio_clip_s,
+                model.overlap_chunk_second,
+                model.min_energy_window_samples);
 
-        int32_t current_position = 0;
-        std::vector<float> logits;
-        for (size_t i = 0; i < prompt.size(); ++i) {
-            const bool need_logits = (i + 1 == prompt.size());
-            logits = decoder_step(model, prompt[i], current_position++, cross_kv, self_kv, n_threads, need_logits, &runtime);
+        std::vector<std::string> chunk_texts;
+        chunk_texts.reserve(chunks.size());
+        for (size_t i = 0; i < chunks.size(); ++i) {
+            chunk_texts.push_back(decode_single_segment(model, copy_audio_chunk(pcmf32, chunks[i]), params, n_threads));
         }
 
-        const int32_t remaining = std::max(0, model.decoder.max_sequence_length - current_position);
-        const int32_t max_new_tokens = std::min(params.max_new_tokens, remaining);
-        for (int32_t i = 0; i < max_new_tokens; ++i) {
-            const int32_t next = argmax(logits);
-            if (next == eos_token_id) {
-                break;
-            }
-            generated.push_back(next);
-            logits = decoder_step(model, next, current_position++, cross_kv, self_kv, n_threads, true, &runtime);
-        }
-
-        text = model.vocab.detokenize(generated);
-        GGML_UNUSED(encoder_length);
+        text = join_chunk_texts(chunk_texts, uses_no_space_chunk_separator(params.language) ? "" : " ");
         return true;
     } catch (const std::exception & ex) {
         error = ex.what();

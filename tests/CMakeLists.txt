@@ -115,6 +115,8 @@ set(COHERE_HELPER_TEST test-cohere)
 add_executable(${COHERE_HELPER_TEST} ${COHERE_HELPER_TEST}.cpp)
 target_include_directories(${COHERE_HELPER_TEST} PRIVATE ../src)
 target_link_libraries(${COHERE_HELPER_TEST} PRIVATE whisper-cohere)
+target_compile_definitions(${COHERE_HELPER_TEST} PRIVATE
+    COHERE_TEST_MODEL_PATH="${PROJECT_SOURCE_DIR}/models/for-tests-cohere-transcribe.gguf")
 add_test(NAME ${COHERE_HELPER_TEST} COMMAND ${COHERE_HELPER_TEST})
 set_tests_properties(${COHERE_HELPER_TEST} PROPERTIES LABELS "unit")
 
@@ -124,4 +126,13 @@ add_test(NAME ${TEST_TARGET}
     -m ${PROJECT_SOURCE_DIR}/models/for-tests-cohere-transcribe.gguf
     -l en
     -f ${PROJECT_SOURCE_DIR}/samples/jfk.wav)
+set_tests_properties(${TEST_TARGET} PROPERTIES LABELS "unit")
+
+set(TEST_TARGET test-whisper-cli-cohere-no-punctuation)
+add_test(NAME ${TEST_TARGET}
+    COMMAND $<TARGET_FILE:whisper-cli>
+    -m ${PROJECT_SOURCE_DIR}/models/for-tests-cohere-transcribe.gguf
+    -l en
+    -f ${PROJECT_SOURCE_DIR}/samples/jfk.wav
+    --no-punctuation)
 set_tests_properties(${TEST_TARGET} PROPERTIES LABELS "unit")

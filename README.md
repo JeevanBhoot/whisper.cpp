@@ -107,7 +107,7 @@ ffmpeg -i input.mp3 -ar 16000 -ac 1 -c:a pcm_s16le output.wav
 
 To convert a local Hugging Face snapshot, see the Cohere section in [models/README.md](models/README.md).
 
-Current Cohere support in `whisper-cli` is text-only transcription with an explicit `-l/--language` code.
+Current Cohere support in `whisper-cli` is text-only transcription with language selection via `-l/--language`, automatic long-form chunking for audio beyond the model clip limit, and optional `--no-punctuation` output control.
 
 ## More audio samples
 

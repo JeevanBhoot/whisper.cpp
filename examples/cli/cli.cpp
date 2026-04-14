@@ -99,6 +99,7 @@ struct whisper_params {
     bool print_confidence= false;
     bool print_progress  = false;
     bool no_timestamps   = false;
+    bool punctuation     = true;
     bool log_score       = false;
     bool use_gpu         = true;
     bool flash_attn      = true;
@@ -218,6 +219,7 @@ static bool whisper_params_parse(int argc, char ** argv, whisper_params & params
         else if (                  arg == "--print-confidence")     { params.print_confidence= true; }
         else if (arg == "-pp"   || arg == "--print-progress")       { params.print_progress  = true; }
         else if (arg == "-nt"   || arg == "--no-timestamps")        { params.no_timestamps   = true; }
+        else if (                  arg == "--no-punctuation")       { params.punctuation     = false; }
         else if (arg == "-l"    || arg == "--language")             { params.language        = whisper_param_turn_lowercase(ARGV_NEXT); }
         else if (arg == "-dl"   || arg == "--detect-language")      { params.detect_language = true; }
         else if (                  arg == "--prompt")               { params.prompt          = ARGV_NEXT; }
@@ -333,8 +335,9 @@ static void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params
     fprintf(stderr, "\n");
     fprintf(stderr, "Cohere note:\n");
     fprintf(stderr, "  Cohere Transcribe GGUF models are detected automatically from model metadata.\n");
-    fprintf(stderr, "  Cohere mode currently supports text-only transcription with -m/-f/-l/-t,\n");
-    fprintf(stderr, "  optional -np, and optional -otxt/-of text file output.\n");
+    fprintf(stderr, "  Cohere mode supports text-only transcription with -m/-f/-l/-t,\n");
+    fprintf(stderr, "  automatic long-form chunking, optional --no-punctuation, optional -np,\n");
+    fprintf(stderr, "  and optional -otxt/-of text file output.\n");
     fprintf(stderr, "\n");
 }
 
@@ -345,6 +348,7 @@ static bool cohere_validate_cli_params(const whisper_params & params, std::strin
         "-l", "--language",
         "-t", "--threads",
         "-np", "--no-prints",
+        "--no-punctuation",
         "-otxt", "--output-txt",
         "-of", "--output-file",
     };
@@ -446,7 +450,7 @@ static int cohere_main(const whisper_params & params) {
         cparams.language = params.language.empty() ? "en" : params.language;
         cparams.n_threads = params.n_threads;
         cparams.max_new_tokens = 256;
-        cparams.punctuation = true;
+        cparams.punctuation = params.punctuation;
 
         std::string text;
         if (!cohere::transcribe(model, pcmf32, cparams, text, error)) {
@@ -1164,6 +1168,11 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "error: unsupported model architecture '%s'\n", model_architecture.c_str());
             return 3;
         }
+    }
+
+    if (params.explicit_flags.find("--no-punctuation") != params.explicit_flags.end()) {
+        fprintf(stderr, "error: --no-punctuation is only supported for Cohere Transcribe models\n");
+        return 2;
     }
 
     if (params.language != "auto" && whisper_lang_id(params.language.c_str()) == -1) {

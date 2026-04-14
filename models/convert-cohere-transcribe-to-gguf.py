@@ -253,6 +253,14 @@ def export_model(snapshot_dir: Path, outfile: Path, export_dtype: str) -> None:
     frontend = extract_frontend(feature_extractor)
     supported_languages = list(model.config.supported_languages)
     tokenizer_meta = extract_tokenizer_metadata(processor.tokenizer, supported_languages)
+    overlap_chunk_second = float(getattr(model.config, "overlap_chunk_second", 5.0))
+    min_energy_window_samples = int(
+        getattr(
+            model.config,
+            "min_energy_window_samples",
+            getattr(feature_extractor, "min_energy_window_samples", 1600),
+        )
+    )
 
     encoder_config = model.config.encoder_config.to_dict()
     encoder_metadata = {
@@ -292,6 +300,8 @@ def export_model(snapshot_dir: Path, outfile: Path, export_dtype: str) -> None:
         writer,
         {
             "max_audio_clip_s": float(model.config.max_audio_clip_s),
+            "overlap_chunk_second": overlap_chunk_second,
+            "min_energy_window_samples": min_energy_window_samples,
             **{f"frontend.{key}": value for key, value in frontend.items()},
             **{f"encoder.{key}": value for key, value in encoder_metadata.items()},
             **{f"decoder.{key}": value for key, value in decoder_metadata.items()},

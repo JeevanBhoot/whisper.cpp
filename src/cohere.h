@@ -80,6 +80,8 @@ struct model {
     tokenizer vocab;
 
     float max_audio_clip_s = 0.0f;
+    float overlap_chunk_second = 5.0f;
+    int32_t min_energy_window_samples = 1600;
 
     bool has_encoder_decoder_proj = false;
 
